@@ -1,0 +1,15 @@
+{
+  "files.exclude": {
+    "**/obj": true,
+    "**/bin": true,
+    "**/.git": true
+  },
+  "search.exclude": {
+    "**/obj": true,
+    "**/bin": true
+  },
+  "omnisharp.useModernNet": false,
+  "omnisharp.enableEditorConfigSupport": false,
+  "omnisharp.enableRoslynAnalyzers": false,
+  "dotnet.defaultSolution": "MCG_CreateLashingHole.sln"
+}
