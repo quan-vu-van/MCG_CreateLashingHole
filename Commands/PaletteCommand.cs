@@ -1,0 +1,57 @@
+using System;
+using Autodesk.AutoCAD.Runtime;
+using Autodesk.AutoCAD.Windows;
+using SDS.UI.Views;
+
+[assembly: CommandClass(typeof(SDS.UI.Commands.PaletteCommand))]
+
+namespace SDS.UI.Commands
+{
+    public class PaletteCommand
+    {
+        private static PaletteSet _ps = null;
+
+        [CommandMethod("CFS_VehicleScripts")]
+        public void ShowVehiclePalette()
+        {
+            try
+            {
+                if (_ps == null)
+                {
+                    // 1. Khởi tạo cơ bản với GUID
+                    Guid psGuid = new Guid("92c7eb64-987c-43c6-a03a-46489a354e03");
+                    _ps = new PaletteSet("Vehicle APDL Scripts", psGuid);
+
+                    // 2. Nạp nội dung (AddVisual) PHẢI thực hiện trước khi set Dock/AutoRollUp
+                    VehicleApdlPalette wpfControl = new VehicleApdlPalette();
+                    _ps.AddVisual("Export Tools", wpfControl);
+
+                    // 3. Thiết lập các thông số về kích thước và khả năng neo
+                    _ps.DockEnabled = DockSides.Right | DockSides.Left;
+                    _ps.Size = new System.Drawing.Size(400, 600);
+                    _ps.KeepFocus = true;
+                }
+
+                // 4. HIỂN THỊ TRƯỚC (Quan trọng: Phải visible thì AutoCAD mới cho phép gán Dock)
+                _ps.Visible = true;
+
+                // 5. THIẾT LẬP NEO SAU KHI ĐÃ VISIBLE
+                // Chuyển Dock và AutoRollUp ra ngoài khối 'if null' để đảm bảo luôn thực thi
+                _ps.Dock = DockSides.Right;
+                //_ps.AutoRollUp = false;
+
+                // 6. Kích hoạt tab
+                if (_ps.Count > 0)
+                {
+                    _ps.Activate(0);
+                }
+            }
+            catch (System.Exception ex)
+            {
+                var ed = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+                ed.WriteMessage("\nError: " + ex.Message);
+                ed.WriteMessage("\nStackTrace: " + ex.StackTrace);
+            }
+        }
+    }
+}
