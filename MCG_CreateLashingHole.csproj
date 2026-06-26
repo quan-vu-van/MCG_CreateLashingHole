@@ -1,0 +1,77 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <Platforms>x64</Platforms>
+    <Configurations>Debug;Release</Configurations>
+    <LangVersion>latest</LangVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>SDS</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <MSBuildWarningsAsMessages>MSB3061</MSBuildWarningsAsMessages>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- Debug: timestamp để tránh lock DLL khi AutoCAD đang mở -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <BuildTimestamp>$([System.DateTime]::Now.ToString("yyyyMMdd_HHmmss"))</BuildTimestamp>
+    <AssemblyName>MCG_LashingHole_$(BuildTimestamp)</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Release: tên chuẩn MCG_* theo MCGVN Installation Guide -->
+  <PropertyGroup Condition="'$(Configuration)' != 'Debug'">
+    <AssemblyName>MCG_LashingHole</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Auto-detect AutoCAD installation path (2021 → 2025) -->
+  <PropertyGroup>
+    <AcadPath Condition="Exists('C:\Program Files\Autodesk\AutoCAD 2025')">C:\Program Files\Autodesk\AutoCAD 2025</AcadPath>
+    <AcadPath Condition="'$(AcadPath)' == '' and Exists('C:\Program Files\Autodesk\AutoCAD 2024')">C:\Program Files\Autodesk\AutoCAD 2024</AcadPath>
+    <AcadPath Condition="'$(AcadPath)' == '' and Exists('C:\Program Files\Autodesk\AutoCAD 2023')">C:\Program Files\Autodesk\AutoCAD 2023</AcadPath>
+    <AcadPath Condition="'$(AcadPath)' == '' and Exists('C:\Program Files\Autodesk\AutoCAD 2022')">C:\Program Files\Autodesk\AutoCAD 2022</AcadPath>
+    <AcadPath Condition="'$(AcadPath)' == ''">C:\Program Files\Autodesk\AutoCAD 2021</AcadPath>
+  </PropertyGroup>
+
+  <!-- References AutoCAD API trực tiếp từ máy (không cần NuGet restore) -->
+  <ItemGroup>
+    <Reference Include="acdbmgd">
+      <HintPath>$(AcadPath)\acdbmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(AcadPath)\acmgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="accoremgd">
+      <HintPath>$(AcadPath)\accoremgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- WPF & WinForms -->
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="WindowsFormsIntegration" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="PresentationFramework" />
+    <Reference Include="WindowsBase" />
+    <Reference Include="System.Xaml" />
+  </ItemGroup>
+
+  <!-- Log tên DLL sau mỗi lần build -->
+  <Target Name="WriteBuildInfo" AfterTargets="Build">
+    <Message Text="[Build OK] $(AssemblyName).dll → $(OutputPath)" Importance="High" />
+  </Target>
+
+  <!-- Release: copy DLL vào C:\CustomTools\Autocad -->
+  <Target Name="DeployToCustomTools" AfterTargets="Build" Condition="'$(Configuration)' != 'Debug'">
+    <MakeDir Directories="C:\CustomTools\Autocad" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="C:\CustomTools\Autocad" ContinueOnError="true" />
+    <Message Text="[Deploy] $(AssemblyName).dll → C:\CustomTools\Autocad" Importance="High" />
+  </Target>
+
+</Project>
