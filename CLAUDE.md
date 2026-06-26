@@ -19,7 +19,7 @@ Sau khi đọc xong, **báo cáo ngắn**:
 
 ---
 
-## 2. Thông tin dự án
+## 2. Thông tin dự
 
 ```
 Tên project   : MCG_CreateLashingHole
