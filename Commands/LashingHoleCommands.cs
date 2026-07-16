@@ -1,11 +1,11 @@
 using System;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.AutoCAD.Windows;
-using SDS.UI;
+using MCG_CreateLashingHole.UI;
 
-[assembly: CommandClass(typeof(SDS.Commands.LashingHoleCommands))]
+[assembly: CommandClass(typeof(MCG_CreateLashingHole.Commands.LashingHoleCommands))]
 
-namespace SDS.Commands
+namespace MCG_CreateLashingHole.Commands
 {
     public class LashingHoleCommands
     {
@@ -24,15 +24,14 @@ namespace SDS.Commands
 
                     _ps.AddVisual("Generator", new LashingHolePalette());
                     _ps.DockEnabled = DockSides.Right | DockSides.Left;
-                    _ps.Size = new System.Drawing.Size(380, 740);
-                    _ps.KeepFocus = true;
+                    _ps.Size        = new System.Drawing.Size(380, 800);
+                    _ps.KeepFocus   = true;
                 }
 
                 _ps.Visible = true;
-                _ps.Dock = DockSides.Right;
+                _ps.Dock    = DockSides.Right;
 
-                if (_ps.Count > 0)
-                    _ps.Activate(0);
+                if (_ps.Count > 0) _ps.Activate(0);
             }
             catch (System.Exception ex)
             {

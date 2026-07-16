@@ -2,92 +2,183 @@ using System;
 using System.Collections.Generic;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
-using SDS.Models;
-using SDS.Utilities;
+using MCG_CreateLashingHole.Models;
+using MCG_CreateLashingHole.Utilities;
 
-namespace SDS.Services
+namespace MCG_CreateLashingHole.Services
 {
     /// <summary>
-    /// Phase 3 — Tái tạo lỗ lashing trong khu vực đặc biệt giữa 2 hole đã có.
-    /// Logic: User chọn hole đầu và hole cuối → tool tính khoảng trống và
-    /// điền holes trung gian theo spacing, với auto-detect hướng đối xứng.
+    /// Phase 3 — Điền lỗ lashing vào khu vực đặc biệt giữa 2 hole hiện có (Start/End Anchor).
+    /// Implements GAP HANDLING 3 cases từ VBA gốc:
+    ///   Case 1: gap mod spacing ≈ 0  → fill đều tại spacing chuẩn
+    ///   Case 2: remainder lớn        → thêm 1 slot, re-space đều
+    ///   Case 3: remainder nhỏ        → điều chỉnh spacing để hấp thụ remainder
+    /// Vẽ DUAL CIRCLE (inner + outer) khớp với BlockPackingService.
     /// </summary>
     public class GridGenerationService
     {
+        private const string LOG_PREFIX = "[GridGeneration]";
+
         private readonly CollisionEngineService _collision;
+        private const double TOLERANCE = 1.0;
 
         public GridGenerationService(CollisionEngineService collision)
         {
             _collision = collision;
         }
 
+        // ─────────────────────────────────────────────────────────────
+        // API chính
+        // ─────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Điền holes vào khoảng trống giữa startHole và endHole.
+        /// Điền holes vào khoảng trống giữa startHole (Start Anchor) và endHole (End Anchor).
+        /// Trả về danh sách ObjectId của innerCircle đã tạo.
         /// </summary>
         public List<ObjectId> RegenerateSpecialArea(
-            Circle startHole,
-            Circle endHole,
-            Polyline boundary,
-            double spacing,
-            double offset,
-            bool isVertical,
+            Circle           startHole,
+            Circle           endHole,
+            Polyline         boundary,
+            double           spacing,
+            double           offset,
+            bool             isVertical,
             LashingInputParams p,
-            Transaction tr,
+            Transaction      tr,
             BlockTableRecord space)
         {
-            var created = new List<ObjectId>();
-            double radius = startHole.Radius;
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Bắt đầu RegenerateSpecialArea...");
+
+            var created  = new List<ObjectId>();
+            var db       = space.Database;
+            double radius = startHole.Radius; // Dùng radius của Start Anchor
+
+            // Đảm bảo layers tồn tại
+            BlockPackingService.EnsureLayerExists(LashingInputParams.LAYER_INNER_HOLE,  db, tr);
+            BlockPackingService.EnsureLayerExists(LashingInputParams.LAYER_OUTER_CLEAR, db, tr);
 
             Point3d startCenter = startHole.Center;
-            Point3d endCenter = endHole.Center;
+            Point3d endCenter   = endHole.Center;
 
-            // 1. Xác định hướng phát triển đối xứng từ midpoint so với tâm panel
-            Point3d midPt = new Point3d(
-                (startCenter.X + endCenter.X) / 2.0,
-                (startCenter.Y + endCenter.Y) / 2.0, 0);
+            // Xác định trục động (moving) và trục cố định
+            double startCoord = isVertical ? startCenter.Y : startCenter.X;
+            double endCoord   = isVertical ? endCenter.Y   : endCenter.X;
+            double fixedCoord = isVertical ? startCenter.X : startCenter.Y;
 
-            Extents3d panelBox = boundary.GeometricExtents;
-            Point3d panelCenter = new Point3d(
-                (panelBox.MinPoint.X + panelBox.MaxPoint.X) / 2.0,
-                (panelBox.MinPoint.Y + panelBox.MaxPoint.Y) / 2.0, 0);
+            double gap = Math.Abs(endCoord - startCoord);
+            double dir = endCoord > startCoord ? 1.0 : -1.0; // Hướng từ start → end
 
-            // genDir: +1 nếu midpoint nằm về phía dương so với tâm, -1 nếu ngược lại
-            int genDir = isVertical
-                ? (midPt.Y >= panelCenter.Y ? 1 : -1)
-                : (midPt.X >= panelCenter.X ? 1 : -1);
+            System.Diagnostics.Debug.WriteLine(
+                $"{LOG_PREFIX} gap={gap:F0}mm, spacing={spacing:F0}mm, isVertical={isVertical}");
 
-            // 2. Tính số holes cần tạo trong khoảng trống
-            double gap = isVertical
-                ? Math.Abs(endCenter.Y - startCenter.Y)
-                : Math.Abs(endCenter.X - startCenter.X);
-
-            int nHoles = (int)Math.Round(gap / spacing) - 1;
-            if (nHoles <= 0) return created;
-
-            double baseCoordFixed = isVertical ? startCenter.X : startCenter.Y;
-            double baseCoordMoving = isVertical
-                ? Math.Min(startCenter.Y, endCenter.Y)
-                : Math.Min(startCenter.X, endCenter.X);
-
-            // 3. Tạo các hole trung gian
-            for (int i = 1; i <= nHoles; i++)
+            // --- Check case where Start and End are too close ---
+            if (gap < spacing * 0.5)
             {
-                double movingCoord = baseCoordMoving + i * spacing;
-                Point3d candidate = isVertical
-                    ? new Point3d(baseCoordFixed, movingCoord, 0)
-                    : new Point3d(movingCoord, baseCoordFixed, 0);
-
-                if (!AutoCADGeometryHelper.IsInsidePolyline(candidate, boundary))
-                    continue;
-
-                var circle = new Circle(candidate, Vector3d.ZAxis, radius);
-                circle.Layer = p.HoleLayer;
-                space.AppendEntity(circle);
-                tr.AddNewlyCreatedDBObject(circle, true);
-                created.Add(circle.ObjectId);
+                System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Khoảng cách quá nhỏ, bỏ qua.");
+                return created;
             }
 
+            // --- GAP HANDLING LOGIC (3 Cases từ VBA) ---
+            double baseCoord   = Math.Min(startCoord, endCoord); // Start anchor tọa độ nhỏ hơn
+            List<double> coords = CalculateIntermediateCoords(gap, spacing, baseCoord, dir);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"{LOG_PREFIX} Sẽ tạo {coords.Count} lỗ trung gian.");
+
+            // --- Generate intermediate points (không tạo lại Start/End Anchor) ---
+            foreach (double coord in coords)
+            {
+                Point3d candidate = isVertical
+                    ? new Point3d(fixedCoord, coord, 0)
+                    : new Point3d(coord, fixedCoord, 0);
+
+                if (!AutoCADGeometryHelper.IsInsidePolylineOrEdge(candidate, boundary))
+                    continue;
+
+                // Gap #4: Vẽ DUAL CIRCLE — khớp với BlockPackingService
+                ObjectId innerId = DrawCircle(candidate, radius,
+                    LashingInputParams.LAYER_INNER_HOLE, tr, space, db);
+                DrawCircle(candidate, p.ClearanceRadius,
+                    LashingInputParams.LAYER_OUTER_CLEAR, tr, space, db);
+
+                created.Add(innerId);
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"{LOG_PREFIX} RegenerateSpecialArea THÀNH CÔNG: {created.Count} lỗ tạo mới.");
             return created;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Gap #3: GAP HANDLING — 3 Cases từ VBA gốc
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Tính toán tọa độ các lỗ trung gian theo 3 cases GAP HANDLING.
+        /// Trả về danh sách tọa độ (theo trục động) không bao gồm start/end anchor.
+        /// </summary>
+        private static List<double> CalculateIntermediateCoords(
+            double gap, double spacing, double baseCoord, double dir)
+        {
+            var coords = new List<double>();
+
+            // Số khoảng hoàn chỉnh và phần dư
+            int    nIntervals = (int)Math.Floor(gap / spacing);
+            double remainder  = gap - nIntervals * spacing;
+
+            if (nIntervals <= 0) return coords;
+
+            double actualSpacing;
+
+            if (Math.Abs(remainder) < TOLERANCE)
+            {
+                // Case 1: gap chia đều cho spacing → fill đúng vị trí chuẩn
+                System.Diagnostics.Debug.WriteLine("[GridGeneration] GAP Case 1: Fill đều chuẩn.");
+                actualSpacing = spacing;
+            }
+            else if (remainder > spacing * 0.5)
+            {
+                // Case 2: D > spacing → thêm 1 slot, re-space đều
+                // VBA: "Case 2: D > spacing -> Insert points"
+                nIntervals++;
+                actualSpacing = gap / nIntervals;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[GridGeneration] GAP Case 2: Thêm slot → actualSpacing={actualSpacing:F1}mm");
+            }
+            else
+            {
+                // Case 3: Remainder nhỏ → hấp thụ vào spacing
+                // VBA: "Case 3: Reposition Li-1"
+                actualSpacing = gap / nIntervals;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[GridGeneration] GAP Case 3: Điều chỉnh spacing → actualSpacing={actualSpacing:F1}mm");
+            }
+
+            // --- Generate intermediate points (không bao gồm i=0 và i=nIntervals = anchors) ---
+            for (int i = 1; i < nIntervals; i++)
+            {
+                double coord = baseCoord + i * actualSpacing;
+                coords.Add(coord);
+            }
+
+            return coords;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Helpers
+        // ─────────────────────────────────────────────────────────────
+
+        private static ObjectId DrawCircle(Point3d center, double radius, string layer,
+            Transaction tr, BlockTableRecord space, Database db)
+        {
+            var circle = new Circle();
+            circle.SetDatabaseDefaults(db); // initialize entity với database defaults trước AppendEntity
+            circle.Center = center;
+            circle.Normal = Vector3d.ZAxis;
+            circle.Radius = radius;
+            circle.Layer  = layer;
+            space.AppendEntity(circle);
+            tr.AddNewlyCreatedDBObject(circle, true);
+            return circle.ObjectId;
         }
     }
 }

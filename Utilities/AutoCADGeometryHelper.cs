@@ -1,22 +1,22 @@
 using System;
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 
-namespace SDS.Utilities
+namespace MCG_CreateLashingHole.Utilities
 {
     public static class AutoCADGeometryHelper
     {
         /// <summary>
-        /// Kiểm tra điểm có nằm bên trong Polyline đóng không (ray-casting).
-        /// Hoạt động chính xác với polyline tuyến tính (không có cung arc).
+        /// Kiểm tra điểm có nằm bên trong Polyline không (ray-casting).
+        /// Hỗ trợ cả Closed và Open polyline (VBA: ALLOW OPEN POLYLINE).
         /// </summary>
-        public static bool IsInsidePolyline(Point3d pt, Polyline poly)
+        public static bool IsInsidePolylineOrEdge(Point3d pt, Polyline poly)
         {
-            if (!poly.Closed) return false;
-
             int count = poly.NumberOfVertices;
-            bool inside = false;
+            if (count < 3) return false;
 
+            bool inside = false;
             for (int i = 0, j = count - 1; i < count; j = i++)
             {
                 Point2d pi = poly.GetPoint2dAt(i);
@@ -27,12 +27,89 @@ namespace SDS.Utilities
                     inside = !inside;
             }
 
+            // Nếu open polyline: cũng kiểm tra cạnh đóng ảo (last → first)
+            if (!poly.Closed)
+            {
+                Point2d p0 = poly.GetPoint2dAt(0);
+                Point2d pn = poly.GetPoint2dAt(count - 1);
+                if (((p0.Y > pt.Y) != (pn.Y > pt.Y)) &&
+                    pt.X < (p0.X - pn.X) * (pt.Y - pn.Y) / (p0.Y - pn.Y) + pn.X)
+                    inside = !inside;
+            }
+
             return inside;
         }
 
         /// <summary>
-        /// Lấy 2 điểm góc đối diện (min và max) của bounding box từ Polyline.
+        /// Tính tâm hình học (centroid) của Polyline bằng công thức Shoelace.
+        /// Dùng cho LocationMode.Center thay vì midpoint bounding box.
         /// </summary>
+        public static Point3d GetPolygonCentroid(Polyline poly)
+        {
+            int n = poly.NumberOfVertices;
+            double area = 0, cx = 0, cy = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                Point2d p1 = poly.GetPoint2dAt(i);
+                Point2d p2 = poly.GetPoint2dAt((i + 1) % n);
+                double cross = p1.X * p2.Y - p2.X * p1.Y;
+                area += cross;
+                cx   += (p1.X + p2.X) * cross;
+                cy   += (p1.Y + p2.Y) * cross;
+            }
+
+            area /= 2.0;
+            if (Math.Abs(area) < 1e-9)
+            {
+                // Fallback: midpoint bounding box khi polyline suy biến
+                var ext = poly.GeometricExtents;
+                return new Point3d(
+                    (ext.MinPoint.X + ext.MaxPoint.X) / 2.0,
+                    (ext.MinPoint.Y + ext.MaxPoint.Y) / 2.0, 0);
+            }
+
+            cx /= 6.0 * area;
+            cy /= 6.0 * area;
+            return new Point3d(cx, cy, 0);
+        }
+
+        /// <summary>
+        /// Zoom viewport đến vùng Extents3d + margin.
+        /// PHẢI gọi NGOÀI mọi Transaction đang mở (editor op không được trong transaction).
+        /// </summary>
+        public static void ZoomToBoundary(Editor ed, Extents3d box, double marginMm = 500.0)
+        {
+            try
+            {
+                var    view   = ed.GetCurrentView();
+                double w      = box.MaxPoint.X - box.MinPoint.X + 2 * marginMm;
+                double h      = box.MaxPoint.Y - box.MinPoint.Y + 2 * marginMm;
+                double aspect = view.Width / view.Height;
+                if (w / h < aspect) w = h * aspect;
+                else                h = w / aspect;
+
+                view.Width       = w;
+                view.Height      = h;
+                view.CenterPoint = new Point2d(
+                    (box.MinPoint.X + box.MaxPoint.X) / 2.0,
+                    (box.MinPoint.Y + box.MaxPoint.Y) / 2.0);
+                ed.SetCurrentView(view);
+            }
+            catch { /* Non-critical */ }
+        }
+
+        /// <summary>
+        /// Overload nhận Polyline — đọc GeometricExtents rồi delegate sang overload Extents3d.
+        /// PHẢI gọi NGOÀI mọi Transaction đang mở.
+        /// </summary>
+        public static void ZoomToBoundary(Editor ed, Polyline boundary, double marginMm = 500.0)
+        {
+            try { ZoomToBoundary(ed, boundary.GeometricExtents, marginMm); }
+            catch { }
+        }
+
+        /// <summary>Lấy bounding box an toàn từ Polyline.</summary>
         public static (Point3d min, Point3d max) GetSmartRectFromPolyline(Polyline poly)
         {
             double minX = double.MaxValue, minY = double.MaxValue;
@@ -50,9 +127,7 @@ namespace SDS.Utilities
             return (new Point3d(minX, minY, 0), new Point3d(maxX, maxY, 0));
         }
 
-        /// <summary>
-        /// Trả về 4 góc của hình chữ nhật từ 2 điểm đường chéo.
-        /// </summary>
+        /// <summary>Trả về 4 góc hình chữ nhật từ 2 điểm đường chéo.</summary>
         public static Point3d[] GetRectangularPoints(Point3d p1, Point3d p2)
         {
             return new[]
