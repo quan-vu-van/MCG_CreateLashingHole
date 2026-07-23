@@ -1,3 +1,177 @@
+## Session 2026-07-23 09:40
+
+### Đã làm
+
+**TÁI CẤU TRÚC UX — mô hình VBA UserForm: palette chỉ nhập liệu + START, flow tuần tự chạy tại command line**
+(Quyết định user đã chốt: Full flow như VBA + giữ 2 nút Audit trên palette)
+
+- `Models/LashingHoleModels.cs`: thêm `LashingParamsStore` (static) — cầu nối tham số Palette → CommandMethod.
+- `Services/GridEngineService.cs`:
+  - Overload `GenerateGrid(..., p1, p2, startOption, effCenter, skipCenterAdjust)` — nhận anchor tường minh cho manual mode.
+  - Thêm case start `"P2"` (từ P2 lùi về P1, khớp VBA) + `skipCenterAdjust` (VBA skipInitialAdjustment khi user pick effective center).
+- `Services/BlockPackingService.cs`:
+  - Tách `DrawHolesWithDimensions(...)` public — vẽ dual-circle + tô đỏ + dims cho lưới ĐÃ TÍNH, nhận dimOrigin (P1) + rect P1-P2 tường minh; `GenerateHoles` cũ delegate sang.
+  - `PackIntoBlock` nhận `presetName` (tên block hỏi qua command line).
+- `Services/GridGenerationService.cs` (fill gap):
+  - **Fix bug**: bán kính inner lấy `p.HoleDiameter/2` thay vì `startHole.Radius` (user pick outer R75 → lỗ trung gian bị vẽ sai R75).
+  - Thêm param `structures` → tô đỏ lỗ mới nếu va chạm (khớp VBA highlight sau Phase 3).
+- **MỚI** `Services/LashingWorkflowService.cs` — port trọn flow `CFS_CreateLashingHole`:
+  - `RunCreateFlow`: boundary pick (filter layer 0/AM_0, >20m²) → auto crossing structures (lọc INSERT+AM_11) → adjacent V/H/N + pick adjacent plines → keep-out ảo → P1/P2 (auto bbox theo mode / manual GetPoint+GetCorner) → start P1/P2/Center keyword → effective center pick có validate → PHASE 1 (grid engine + vẽ + dims) → special area Y/N loop (pick 2 outer circle) → local adjust (auto/Y-N) `LocalAdjustRedHoles` (dịch lỗ đỏ 8-hướng, reset ByLayer, dim cũ→mới) → hỏi tên block (default `<PanelName>_L.H`, Esc bỏ qua) → PackIntoBlock.
+  - `RunSpacingAudit` / `RunInterferenceAudit`: tự prompt boundary + tự quét structures — palette không giữ state.
+- `Commands/LashingHoleCommands.cs`: thêm `MCG_LH_RUN`, `MCG_LH_AUDIT`, `MCG_LH_INTERFERE` (mỏng, gọi service qua SafeRun).
+- `UI/LashingHolePalette.xaml(.cs)` viết lại: chỉ còn INPUT + MODE + SETTINGS + **▶ START** + 2 nút AUDIT + status. Bỏ hết: pick boundary/structures, CREATE, Phase 2, Pack Block. Code-behind không còn service/state; `Dispatch()` = validate (port VBA ValidateInput) → SaveSettings → ParamsStore → `SendStringToExecute`.
+
+### Trạng thái
+- Build PASS (0 warning / 0 error). CHƯA test runtime AutoCAD.
+- Palette giờ đúng mô hình VBA UserForm; mọi tương tác qua command line trong command context (không còn editor prompt từ modeless palette).
+
+### Bước tiếp theo
+- Test runtime end-to-end: NETLOAD → `MCG_CreateLashingHole` → START → theo prompts.
+- Artifact mockup UI đã LỖI THỜI (còn UI cũ nhiều nút) — cần cập nhật nếu user muốn.
+- Tinh chỉnh nếu cần: VBA `GetSmartRectangularPointsFromPolyline` dùng long-segment threshold 1500mm, bản port auto dùng bbox corners.
+
+### Ghi chú API
+- Pattern palette→flow: button → `SendStringToExecute("MCG_LH_RUN\n")` → CommandMethod (document tự lock, editor prompt hợp lệ). KHÔNG gọi GetEntity/GetSelection trực tiếp từ modeless palette.
+- `PromptKeywordOptions.AllowNone=true` + `Keywords.Default` → Enter = default; `PromptStatus.None` phân biệt với Esc (Cancel).
+- Editor prompts phải nằm NGOÀI transaction; mỗi phase mở transaction riêng.
+
+---
+
+## Session 2026-07-20 16:27
+
+### Đã làm
+
+**Fix fidelity — tô đỏ lỗ va chạm không né được** (port `CheckAndHighlightConflicts` + hành vi Phase 2)
+- Trước đây: lỗ va chạm mà `FindSafePoint` không né được → `continue` (BỎ lỗ). Sai so với VBA.
+- Nay (`BlockPackingService.GenerateHoles`): va chạm → thử dịch 8-hướng; **dịch được** → vẽ vị trí mới (ByLayer); **không dịch được** → vẽ tại vị trí lưới + **tô đỏ outer circle** (`ColorIndex=1 = acRed`), không drop.
+- `DrawCircle` thêm tham số `markRed`; chỉ outer circle bị tô đỏ (khớp VBA `circleObj.color = acRed`), inner giữ ByLayer.
+- Lỗ đỏ vẫn được gom vào block (PackIntoBlock) và tính trong audit — như VBA.
+
+**Ghi chú tương đương hành vi**: VBA tách 2 bước (CheckAndHighlightConflicts tô đỏ TẤT CẢ lỗ va chạm → Phase 2 optional mới dịch). Bản port gộp: va chạm → dịch ngay → fail mới đỏ. Kết quả cuối KHỚP VBA **auto mode** (auto chạy local adjust): lỗ dịch được = ByLayer, lỗ không dịch được = đỏ.
+
+### Trạng thái
+- Build PASS. Addin đầy đủ nghiệp vụ + đã khôi phục cảnh báo đỏ. CHƯA test runtime AutoCAD.
+
+### Bước tiếp theo
+- Test runtime end-to-end trên panel mẫu; xác nhận lỗ đỏ xuất hiện đúng chỗ va chạm không né được.
+
+---
+
+## Session 2026-07-20 16:16
+
+### Đã làm
+
+**Slice 4b — Cloud-mark interference audit** (port VBA `CheckLashingHole_InterferenceStructure` + `DbxCopyBlock`)
+- Tạo `Services/InterferenceAuditService.cs`:
+  - `RunAudit`: quét outer clearance circle (layer AM_9, R≈clearance) trong boundary; với mỗi lỗ × cấu kiện dùng `Circle.IntersectWith` → va chạm nếu ≥3 giao điểm (VBA uBound>5) hoặc =2 giao điểm mà chord ăn sâu (dist tâm→trung điểm ≤ R−0.0001). Va chạm → chèn block `LashingInterfereCloudMark` tại tâm.
+  - `EnsureInterferenceBlock`: port ObjectDBX — `ReadDwgFile(Symbol.dwg)` + `WblockCloneObjects` copy block vào drawing hiện tại; graceful nếu thiếu file/block.
+  - Proxy-safe: check `ObjectClass.IsDerivedFrom(Circle)` trước GetObject.
+- UI: thêm nút "Audit Interference (Cloud Marks)" + `CmdAuditInterference_Click`; **giữ nguyên** nút audit-text spacing cũ.
+- `Symbol.dwg` xác nhận tồn tại tại `C:\CustomTools\Symbol.dwg`.
+
+### Trạng thái — ADDIN CHUYỂN THỂ HOÀN THIỆN (build PASS)
+Toàn bộ nghiệp vụ VBA đã port sang C# giữ kiến trúc mới:
+1. UI + Registry settings ✅  2. Boundary/structure select (tay+auto) ✅
+3. Grid engine Phase 1 (seeded growth + retreat-and-gap + GAP 3-case) ✅
+4. Dual-circle + full continuous dimensioning ✅  5. Block packing `<PanelName>_L.H` ✅
+6. Phase 2 fill-gap ✅  7. Audit spacing (mới) + Audit interference cloud-mark (VBA) ✅
+- **CHƯA test runtime trong AutoCAD** — cần load `.dll` kiểm chứng end-to-end.
+
+### Bước tiếp theo
+- Test runtime: load bin\x64\Debug\MCG_LashingHole_*.dll, lệnh `MCG_CreateLashingHole`, chạy trên panel mẫu; so lưới/dim/block với VBA gốc.
+- Kiểm chứng `ClassifyCollision` (GetClosestPointTo) vs VBA IntersectWith — xem hướng dịch lỗ có khớp.
+- (Tùy chọn) copy source VBA giải nén vào `docs/legacy_vba/`.
+
+### Ghi chú API
+- ObjectDBX .NET: `new Database(false,true)` + `ReadDwgFile(path, FileShare.Read, true, null)` + `db.WblockCloneObjects(ids, db.BlockTableId, map, DuplicateRecordCloning.Ignore, false)` để import block định nghĩa từ dwg ngoài.
+- `Circle.IntersectWith(ent, Intersect.OnBothOperands, Point3dCollection, IntPtr.Zero, IntPtr.Zero)` — tương đương ActiveX `IntersectWith(acExtendNone)`.
+
+---
+
+## Session 2026-07-20 16:11
+
+### Đã làm
+
+**Slice 4a — Full continuous dimensioning** (port VBA `AddContinuousDimensions`)
+- `BlockPackingService.AddContinuousDimensions()`: phân loại điểm theo hàng/cột → chọn hàng dài nhất (ngang) + cột dài nhất (đứng) → chuỗi dim liên tục gồm mốc P1 + biên rect, bỏ đoạn trùng/0.
+- Helper `CreateAlignedDim` (set `Dimscale=25` trên entity), `GetUniqueSorted` (distinct key "0.000" + sort), `CK`.
+- Wire vào `GenerateHoles`: thu `drawnPoints`, suy P1 theo LocationMode (StarBoard→Trên-Trái, còn lại→Dưới-Trái), gọi dim với rect = bbox boundary.
+- Dim tạo trên layer `Mechanical-AM_9` → `PackIntoBlock` (Slice 2) tự gom vào block.
+
+### Trạng thái
+- Build PASS. Output Phase 1 giờ đủ: lưới né va chạm + dual circle + chuỗi dimension → gom block. CHƯA test runtime AutoCAD.
+
+### Bước tiếp theo
+- **Slice 4b — Cloud-mark interference audit** (cần quyết định): port `CheckLashingHole_InterferenceStructure` — chèn block `LashingInterfereCloudMark` từ `C:\CustomTools\Symbol.dwg` (ObjectDBX). Phụ thuộc file ngoài + khác audit-text hiện tại.
+
+---
+
+## Session 2026-07-20 16:05
+
+### Đã làm
+
+**Slice 3 — Port Phase 1 Grid Engine trung thành** (phần lõi lớn nhất)
+- Tạo `Services/GridEngineService.cs` — port từ VBA `mod_MainLashingHole_V3`:
+  - `GenerateCentralPoints`: gieo mầm từ effective-center, mọc 4 hướng (Center mode) hoặc từ P1 (PortSide/StarBoard).
+  - `GenerateLineOfPoints`: mọc điểm dọc trục + retreat-and-gap + GAP HANDLING 3 case (Case 2 chèn điểm, Case 3 reposition Li-1).
+  - `AdjustPointAlongAxis` (gộp AdjustPointHorizontal/Vertical), `AdjustInitialCenter8Dir` + `FindSafePointAlongDirection`.
+  - Hằng số khớp VBA: `MIN_DIST_FACTOR_AFTER_RETREAT=0.25`, `RETREAT_STEP_MM=5`, `MIN_EDGE_DISTANCE_FOR_GAP=200`, `MAX_ITER=100`, `stdMaxRetreat=2·clearance+20`.
+  - Dict key khớp VBA `GetCoordKey` = format "0.000".
+  - Va chạm dùng `CollisionEngineService.HasAnyCollision` (RAM) thay vì vẽ circle tạm — giữ kiến trúc mới.
+- `BlockPackingService`: thay `BuildGridPoints` (nested-loop rút gọn) bằng `_gridEngine.GenerateGrid(...)`; xoá `BuildGridPoints` cũ.
+- Map LocationMode → thuật toán: Center→"Center" (centroid), PortSide→"P1" (dirX=1,dirY=1), StarBoard→"P1" (dirX=1,dirY=-1).
+
+### Trạng thái
+- Build `dotnet build -c Debug` PASS. CHƯA test runtime trong AutoCAD (cần load .dll kiểm chứng lưới thực tế).
+- Grid engine trả điểm đã né va chạm + trong boundary → vòng lặp FindSafePoint trong GenerateHoles giờ chỉ là lưới an toàn dự phòng.
+
+### Bước tiếp theo (để "addin hoàn thiện")
+- **Slice 4a — Full continuous dimensioning**: port `AddContinuousDimensions` (chuỗi dim dọc từng hàng/cột của lưới cuối), thay vì chỉ dim lỗ điều chỉnh. Self-contained, không cần file ngoài.
+- **Slice 4b — Cloud-mark interference audit**: port `CheckLashingHole_InterferenceStructure` — chèn block `LashingInterfereCloudMark` từ `C:\CustomTools\Symbol.dwg` (ObjectDBX). CẦN xác nhận: phụ thuộc file Symbol.dwg + thay hành vi audit text hiện tại.
+- Kiểm chứng runtime: so lưới engine vs VBA gốc trên cùng 1 panel mẫu.
+
+### Ghi chú API
+- P1 mode: lưới = (X trên trục row) × (Y trên trục col) — chỉ lấy toạ độ nằm trên trục cơ sở, khớp VBA `xCoordsOnEffectiveRowAxis`/`yCoordsOnEffectiveColAxis`.
+- `AdjustPointAlongAxis`: retreatDir = -genDir (luôn ngược hướng mọc); nhánh `retreatDir==genDir` trong VBA là dead code nên đã bỏ.
+
+---
+
+## Session 2026-07-20 15:55
+
+### Đã làm
+
+**Trích xuất & phân tích VBA gốc từ `CreateLashingHole.dvb`**
+- Viết extractor C# (ole32 + giải nén MS-OVBA) bung được 6 module: `mod_MainLashingHole_V3` (2575 dòng), `mod_LashingHoleInterference`, `ModInputHelper_V3`, `frmLashingInput`, `frmHelpDialog`, `ThisDrawing`.
+- Đối chiếu VBA gốc ↔ addin C#: addin hiện là bản viết lại rút gọn ~50-60%, còn thiếu grid engine Phase 1, block packing, cloud-mark audit, full dimensioning.
+
+**Quyết định hướng port**: Lấp gap, giữ kiến trúc mới (RAM collision + service tách lớp).
+
+**Slice 1 — Fix layer fidelity** (`Models/LashingHoleModels.cs`)
+- `LAYER_INNER_HOLE`: `Mechanical-AM_0` → `"0"` (khớp VBA `holeLayerName`)
+- `LAYER_OUTER_CLEAR`: `Mechanical-AM_3` → `Mechanical-AM_9` (khớp VBA `clearanceLayerName`)
+- Sai layer trước đây sẽ làm audit interference hỏng (VBA lọc outer theo `Mechanical-AM_9`).
+
+**Slice 2 — Block Packing thật** (port đoạn "BLOCK PACKING" của VBA)
+- `BlockPackingService.PackIntoBlock()`: gom inner/outer circle (khớp bán kính) + dimension trong boundary → tạo block `<PanelName>_L.H` (tên duy nhất) → `DeepCloneObjects` → insert 1 block reference → xóa entity gốc.
+- Quét ModelSpace an toàn proxy: check `ObjectClass.IsDerivedFrom` TRƯỚC khi `GetObject` (theo pattern SESSION trước).
+- UI: thêm nút "Pack Holes → Create Block" + handler `CmdPackBlock_Click` (`LashingHolePalette`).
+
+### Trạng thái
+- Phase hiện tại: Migration VBA → C# addin, hướng "lấp gap giữ kiến trúc".
+- Build `dotnet build -c Debug` PASS (net48 + AutoCAD 2023). CHƯA test runtime trong AutoCAD.
+- Source VBA đã giải nén: `scratchpad/dvbextract/out/*.vba` (chưa copy vào repo).
+
+### Bước tiếp theo
+- **Slice 3 (lõi, lớn nhất)**: Port Phase 1 grid engine trung thành — `GenerateCentralPoints` + `GenerateLineOfPoints` (seeded line-growth 4 hướng từ effective-center + retreat-and-gap + tái phân bố Li-1), thay `BuildGridPoints` nested-loop hiện tại.
+- **Slice 4**: Full continuous dimensioning (`AddContinuousDimensions`) + cloud-mark interference audit (chèn block `LashingInterfereCloudMark` từ `Symbol.dwg`).
+- Kiểm chứng: `ClassifyCollision` C# dùng `GetClosestPointTo` (comment ghi V/H có thể bị đảo) — cần test so với VBA `IntersectWith`.
+
+### Ghi chú API
+- `.dvb` = OLE Compound File, VBA source nén MS-OVBA; nested `VBA_Project/VBA/dir` + module streams (offset lấy từ record `0x0031` trong `dir`).
+- Block packing: set `BlockTableRecord.Origin = basePt` + insert `BlockReference` tại `basePt` → geometry giữ nguyên tọa độ world (tương đương VBA `Blocks.Add(p1)` + `InsertBlock(p1)`).
+
+---
+
 ## Session 2026-06-29 15:10
 
 ### Đã làm

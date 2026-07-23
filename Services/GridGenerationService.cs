@@ -44,13 +44,15 @@ namespace MCG_CreateLashingHole.Services
             bool             isVertical,
             LashingInputParams p,
             Transaction      tr,
-            BlockTableRecord space)
+            BlockTableRecord space,
+            IList<Entity>    structures = null)
         {
             System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Bắt đầu RegenerateSpecialArea...");
 
             var created  = new List<ObjectId>();
             var db       = space.Database;
-            double radius = startHole.Radius; // Dùng radius của Start Anchor
+            // Bán kính lỗ thực lấy từ form — user pick outer circle (R=clearance) nên KHÔNG dùng startHole.Radius
+            double radius = p.HoleDiameter / 2.0;
 
             // Đảm bảo layers tồn tại
             BlockPackingService.EnsureLayerExists(LashingInputParams.LAYER_INNER_HOLE,  db, tr);
@@ -94,11 +96,20 @@ namespace MCG_CreateLashingHole.Services
                 if (!AutoCADGeometryHelper.IsInsidePolylineOrEdge(candidate, boundary))
                     continue;
 
-                // Gap #4: Vẽ DUAL CIRCLE — khớp với BlockPackingService
+                // Vẽ DUAL CIRCLE — khớp với BlockPackingService
                 ObjectId innerId = DrawCircle(candidate, radius,
                     LashingInputParams.LAYER_INNER_HOLE, tr, space, db);
-                DrawCircle(candidate, p.ClearanceRadius,
+                ObjectId outerId = DrawCircle(candidate, p.ClearanceRadius,
                     LashingInputParams.LAYER_OUTER_CLEAR, tr, space, db);
+
+                // Tô đỏ nếu lỗ mới va chạm cấu kiện (khớp VBA highlight sau Phase 3
+                // để bước Local Adjustment nhận diện xử lý tiếp)
+                if (structures != null && structures.Count > 0 &&
+                    _collision.GetWorstCollision(candidate, p.ClearanceRadius, structures).CollisionOccurred)
+                {
+                    var oc = (Circle)tr.GetObject(outerId, OpenMode.ForWrite);
+                    oc.ColorIndex = 1;
+                }
 
                 created.Add(innerId);
             }

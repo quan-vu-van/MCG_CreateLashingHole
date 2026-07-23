@@ -17,9 +17,13 @@ namespace MCG_CreateLashingHole.Models
 
     public class LashingInputParams
     {
-        // Layer chuẩn — khớp với VBA gốc
-        public const string LAYER_INNER_HOLE  = "Mechanical-AM_0"; // Lỗ thực (innerCircle)
-        public const string LAYER_OUTER_CLEAR = "Mechanical-AM_3"; // Vùng clearance (outerCircle)
+        // Layer chuẩn — khớp CHÍNH XÁC với VBA gốc (DrawLashingHoleCircles):
+        //   holeLayerName      = "0"
+        //   clearanceLayerName = "Mechanical-AM_9"
+        // Dimension Phase 3 (PerformSpecialAreaAdjustment_Phase3) cũng dùng "Mechanical-AM_9".
+        // Audit interference (mod_LashingHoleInterference) lọc outer circle theo layer "Mechanical-AM_9".
+        public const string LAYER_INNER_HOLE  = "0";               // Lỗ thực (innerCircle)
+        public const string LAYER_OUTER_CLEAR = "Mechanical-AM_9"; // Vùng clearance (outerCircle)
         public const string LAYER_DIMENSION   = "Mechanical-AM_9"; // Kích thước
 
         public double HoleDiameter    { get; set; } = 55.0;
@@ -40,5 +44,14 @@ namespace MCG_CreateLashingHole.Models
         public LashingCollisionType CollisionType   { get; set; } = LashingCollisionType.None;
         public double             DeltaX            { get; set; } = 0;
         public double             DeltaY            { get; set; } = 0;
+    }
+
+    /// <summary>
+    /// Cầu nối tham số giữa Palette (WPF) và CommandMethod (flow tuần tự).
+    /// Palette ghi trước khi SendStringToExecute; command đọc khi bắt đầu chạy.
+    /// </summary>
+    public static class LashingParamsStore
+    {
+        public static LashingInputParams Current { get; set; }
     }
 }

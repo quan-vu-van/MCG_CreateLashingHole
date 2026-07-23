@@ -99,7 +99,7 @@
 
             <Separator/>
 
-            <!-- ══ EXECUTION MODES (RadioButtons — khớp VBA Option Buttons) ══ -->
+            <!-- ══ EXECUTION MODE (khớp VBA Option Buttons) ══ -->
             <TextBlock Text="EXECUTION MODE" Style="{StaticResource SectionHeader}"/>
 
             <RadioButton x:Name="rbPortSide" GroupName="LocationMode" IsChecked="True"
@@ -117,58 +117,36 @@
             <!-- ══ SETTINGS ══ -->
             <TextBlock Text="SETTINGS" Style="{StaticResource SectionHeader}"/>
 
-            <CheckBox x:Name="chkAutomatic"     Content="Automatic Generate (auto-detect boundary + structures)"
+            <CheckBox x:Name="chkAutomatic"
+                      Content="Automatic Generate (auto P1-P2, start at Center)"
                       Margin="4,3,0,3"/>
-            <CheckBox x:Name="chkCheckAdjacent" Content="Check Adjacent Panels (keep-out zones)"
+            <CheckBox x:Name="chkCheckAdjacent"
+                      Content="Check Adjacent Panels (keep-out zones)"
                       Margin="4,3,0,3"/>
 
             <Separator/>
 
-            <!-- ══ PREPARATION ══ -->
-            <TextBlock Text="PREPARATION" Style="{StaticResource SectionHeader}"/>
-
-            <!-- Pick Boundary — không hiển thị nếu Automatic được chọn -->
-            <Button x:Name="cmdPickBoundary" Content="1.  Select Boundary Polyline"
-                    Click="CmdPickBoundary_Click"
-                    Background="#1A3A10" Foreground="White" Height="28"
-                    BorderBrush="#4CAF50" BorderThickness="1" Margin="0,0,0,3"/>
-            <TextBlock x:Name="lblBoundary" Text="— not selected —"
-                       Foreground="#666" FontSize="10" Margin="4,0,0,8"/>
-
-            <Button x:Name="cmdPickStructures" Content="2.  Select Structural Elements"
-                    Click="CmdPickStructures_Click"
-                    Background="#0F2535" Foreground="White" Height="28"
-                    BorderBrush="#2196F3" BorderThickness="1" Margin="0,0,0,3"/>
-            <TextBlock x:Name="lblStructures" Text="— not selected —"
-                       Foreground="#666" FontSize="10" Margin="4,0,0,8"/>
-
-            <!-- ══ MAIN ACTION ══ -->
-            <Button x:Name="cmdCreate" Content="CREATE LASHING HOLES"
-                    Click="CmdCreate_Click"
-                    Background="#1A4A8A" Foreground="White" Height="36"
-                    FontWeight="Bold" FontSize="13"
-                    BorderBrush="#2196F3" BorderThickness="1" Margin="0,2,0,10"/>
-
-            <Separator/>
-
-            <!-- ══ PHASE 2 — SPECIAL AREA ══ -->
-            <TextBlock Text="PHASE 2 — SPECIAL AREA" Style="{StaticResource SectionHeader}"/>
-            <TextBlock TextWrapping="Wrap" FontSize="10" Foreground="#888888" Margin="0,0,0,5">
-                Select 2 existing holes → fill intermediate holes in the gap.
-            </TextBlock>
-            <Button x:Name="cmdPhase2" Content="Pick 2 Holes  →  Fill Gap"
-                    Click="CmdPhase2_Click"
-                    Background="#3A1A0A" Foreground="White" Height="28"
-                    BorderBrush="#FF6030" BorderThickness="1" Margin="0,0,0,8"/>
+            <!-- ══ START — mọi bước tiếp theo chạy tại command line ══ -->
+            <Button x:Name="cmdStart" Content="▶  START"
+                    Click="CmdStart_Click"
+                    Background="#1A4A8A" Foreground="White" Height="40"
+                    FontWeight="Bold" FontSize="14"
+                    BorderBrush="#2196F3" BorderThickness="1" Margin="0,4,0,4"/>
+            <TextBlock Text="All steps run on the command line after Start."
+                       Foreground="#888888" FontSize="10" Margin="4,0,0,8"/>
 
             <Separator/>
 
             <!-- ══ AUDIT ══ -->
             <TextBlock Text="AUDIT" Style="{StaticResource SectionHeader}"/>
-            <Button x:Name="cmdAudit" Content="Audit Holes in Boundary"
+            <Button x:Name="cmdAudit" Content="Audit Holes in Boundary (spacing report)"
                     Click="CmdAudit_Click"
                     Background="#2A1A3A" Foreground="White" Height="28"
-                    BorderBrush="#9C6FCC" BorderThickness="1" Margin="0,0,0,8"/>
+                    BorderBrush="#9C6FCC" BorderThickness="1" Margin="0,0,0,4"/>
+            <Button x:Name="cmdAuditInterference" Content="Audit Interference (Cloud Marks)"
+                    Click="CmdAuditInterference_Click"
+                    Background="#3A0A1A" Foreground="White" Height="28"
+                    BorderBrush="#CC5070" BorderThickness="1" Margin="0,0,0,8"/>
 
             <Separator/>
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
+using AcRuntime = Autodesk.AutoCAD.Runtime;
 using MCG_CreateLashingHole.Models;
 using MCG_CreateLashingHole.Utilities;
 using D = MCG_CreateLashingHole.Utilities.DiagLogger;
@@ -21,6 +22,7 @@ namespace MCG_CreateLashingHole.Services
         private const string LOG_PREFIX = "[BlockPacking]";
 
         private readonly CollisionEngineService _collision;
+        private readonly GridEngineService      _gridEngine;
 
         private const double DIMSCALE  = 25.0;
         private const double TOLERANCE = 1.0;
@@ -35,7 +37,8 @@ namespace MCG_CreateLashingHole.Services
 
         public BlockPackingService(CollisionEngineService collision)
         {
-            _collision = collision;
+            _collision  = collision;
+            _gridEngine = new GridEngineService(collision);
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -78,12 +81,44 @@ namespace MCG_CreateLashingHole.Services
                     $"{LOG_PREFIX} Keep-out zones: {keepOutZones.Count} đường thẳng ảo.");
             }
 
-            D.Log("  BuildGridPoints...");
-            var gridPoints = BuildGridPoints(p, box, boundary);
-            D.Log($"  Grid: {gridPoints.Count} points");
+            // PHASE 1 — Grid engine port trung thành từ VBA (GenerateCentralPoints):
+            // seeded line-growth + retreat-and-gap. Điểm trả về đã né va chạm + trong boundary.
+            var gridPoints = _gridEngine.GenerateGrid(p, boundary, structures, keepOutZones);
 
-            var innerIds   = new List<ObjectId>();
-            var adjusted   = new List<AdjustedHole>();
+            // P1 cho dimension theo LocationMode (StarBoard = Trên-Trái, còn lại = Dưới-Trái)
+            Point3d p1Auto = p.LocationMode == LashingLocationMode.StarBoard
+                ? new Point3d(box.MinPoint.X, box.MaxPoint.Y, 0)
+                : new Point3d(box.MinPoint.X, box.MinPoint.Y, 0);
+
+            return DrawHolesWithDimensions(p, boundary, structures, keepOutZones, gridPoints, p1Auto,
+                box.MinPoint.X, box.MaxPoint.X, box.MinPoint.Y, box.MaxPoint.Y, tr, space, db);
+        }
+
+        /// <summary>
+        /// Vẽ dual-circle + tô đỏ lỗ không né được + dimension (adjusted + continuous)
+        /// cho danh sách điểm lưới ĐÃ TÍNH SẴN — dùng bởi GenerateHoles và flow MCG_LH_RUN.
+        /// </summary>
+        public List<ObjectId> DrawHolesWithDimensions(
+            LashingInputParams p,
+            Polyline           boundary,
+            List<Entity>       structures,
+            IList<Line3d>      keepOutZones,
+            List<Point3d>      gridPoints,
+            Point3d            dimOrigin,
+            double rectMinX, double rectMaxX, double rectMinY, double rectMaxY,
+            Transaction        tr,
+            BlockTableRecord   space,
+            Database           db)
+        {
+            double radius = p.HoleDiameter / 2.0;
+            EnsureLayerExists(LashingInputParams.LAYER_INNER_HOLE,  db, tr);
+            EnsureLayerExists(LashingInputParams.LAYER_OUTER_CLEAR, db, tr);
+            EnsureLayerExists(LashingInputParams.LAYER_DIMENSION,   db, tr);
+            if (keepOutZones == null) keepOutZones = new List<Line3d>();
+
+            var innerIds    = new List<ObjectId>();
+            var adjusted    = new List<AdjustedHole>();
+            var drawnPoints = new List<Point3d>();
 
             foreach (Point3d candidate in gridPoints)
             {
@@ -91,37 +126,45 @@ namespace MCG_CreateLashingHole.Services
                     continue;
 
                 // Kiểm tra va chạm tại vị trí lưới
-                var col = _collision.GetWorstCollision(candidate, p.ClearanceRadius, structures);
+                var  col      = _collision.GetWorstCollision(candidate, p.ClearanceRadius, structures);
+                bool collides = col.CollisionOccurred ||
+                                HasKeepOutCollision(candidate, p.ClearanceRadius, keepOutZones);
 
-                Point3d finalPt;
-                if (!col.CollisionOccurred &&
-                    !HasKeepOutCollision(candidate, p.ClearanceRadius, keepOutZones))
+                // Né va chạm bằng 8-direction search. Nếu KHÔNG né được → giữ tại vị trí lưới
+                // và tô ĐỎ outer circle (khớp VBA CheckAndHighlightConflicts + Phase 2:
+                // lỗ dịch được reset ByLayer, lỗ không dịch được giữ acRed làm cảnh báo).
+                Point3d finalPt = candidate;
+                bool    markRed = false;
+                if (collides)
                 {
-                    finalPt = candidate; // Không va chạm → giữ nguyên
-                }
-                else
-                {
-                    // Gap #2: 8-direction safe point search
-                    finalPt = _collision.FindSafePoint(
+                    Point3d safe = _collision.FindSafePoint(
                         candidate, p.ClearanceRadius, structures, keepOutZones,
                         boundary, col.CollisionType);
 
-                    if (!AutoCADGeometryHelper.IsInsidePolylineOrEdge(finalPt, boundary))
-                        continue; // Không tìm được vị trí hợp lệ → bỏ qua điểm này
+                    if (safe.DistanceTo(candidate) > TOLERANCE &&
+                        AutoCADGeometryHelper.IsInsidePolylineOrEdge(safe, boundary))
+                        finalPt = safe;      // dịch được → ByLayer
+                    else
+                        markRed = true;      // không dịch được → giữ tại lưới, tô đỏ
                 }
 
-                // Gap #1: Vẽ DUAL CIRCLE — innerCircle + outerCircle
-                D.Log($"  DrawCircle INNER at ({finalPt.X:F0},{finalPt.Y:F0}) r={radius}...");
-                ObjectId innerId = DrawCircle(finalPt, radius,         LashingInputParams.LAYER_INNER_HOLE,  tr, space, db);
-                D.Log($"  DrawCircle OUTER at ({finalPt.X:F0},{finalPt.Y:F0}) r={p.ClearanceRadius}...");
-                           /*outer =*/ DrawCircle(finalPt, p.ClearanceRadius, LashingInputParams.LAYER_OUTER_CLEAR, tr, space, db);
-                D.Log($"  Both circles drawn OK");
+                // Vẽ DUAL CIRCLE — inner ByLayer; outer tô đỏ nếu va chạm không né được
+                ObjectId innerId = DrawCircle(finalPt, radius, LashingInputParams.LAYER_INNER_HOLE,
+                    tr, space, db, markRed: false);
+                DrawCircle(finalPt, p.ClearanceRadius, LashingInputParams.LAYER_OUTER_CLEAR,
+                    tr, space, db, markRed: markRed);
                 innerIds.Add(innerId);
+                drawnPoints.Add(finalPt);
 
-                // Ghi nhận nếu đã bị điều chỉnh (Gap #9)
-                if (finalPt.DistanceTo(candidate) > TOLERANCE)
+                // Dimension chỉ cho lỗ đã dịch (không phải lỗ đỏ đứng yên)
+                if (!markRed && finalPt.DistanceTo(candidate) > TOLERANCE)
                     adjusted.Add(new AdjustedHole(candidate, finalPt));
             }
+
+            // FULL DIMENSIONING — chuỗi dim liên tục theo hàng/cột dài nhất, mốc = dimOrigin (P1)
+            AddContinuousDimensions(drawnPoints, dimOrigin,
+                rectMinX, rectMaxX, rectMinY, rectMaxY,
+                LashingInputParams.LAYER_DIMENSION, tr, space, db);
 
             // Gap #9: Dimension CHỈ cho các lỗ bị điều chỉnh
             // db.Dimscale không set ở đây — gây reactor callback crash trong transaction.
@@ -139,46 +182,135 @@ namespace MCG_CreateLashingHole.Services
         }
 
         // ─────────────────────────────────────────────────────────────
-        // Gap #12: Build grid points — Center mode dùng polygon centroid
+        // BLOCK PACKING — port đoạn "BLOCK PACKING" trong VBA CFS_CreateLashingHole:
+        // gom toàn bộ inner/outer circle + dimension nằm trong boundary → tạo block
+        // "<PanelName>_L.H" → insert 1 block reference → xóa entity gốc.
+        // Quét theo layer + bán kính để tự bắt cả lỗ do Phase 2 tạo thêm và tránh
+        // gom nhầm circle lạ trên cùng layer.
+        // Trả về tên block cuối cùng, hoặc null nếu không có entity nào để gom.
         // ─────────────────────────────────────────────────────────────
-
-        private static List<Point3d> BuildGridPoints(
-            LashingInputParams p, Extents3d box, Polyline boundary)
+        public string PackIntoBlock(
+            LashingInputParams p,
+            Polyline           boundary,
+            Transaction        tr,
+            Database           db,
+            BlockTableRecord   modelSpace,
+            string             presetName = null)
         {
-            var    pts = new List<Point3d>();
-            double w   = box.MaxPoint.X - box.MinPoint.X;
-            double h   = box.MaxPoint.Y - box.MinPoint.Y;
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Bắt đầu PackIntoBlock...");
 
-            switch (p.LocationMode)
+            // 1. Thu thập entity thuộc lưới lashing bên trong boundary
+            var ids = CollectLashingEntities(p, boundary, tr, modelSpace);
+            if (ids.Count == 0)
             {
-                case LashingLocationMode.PortSide:
-                    // P1 = góc Dưới-Trái → phát triển lên trên và sang phải
-                    for (double y = box.MinPoint.Y + p.OffsetY; y <= box.MaxPoint.Y - p.OffsetY / 2; y += p.SpacingY)
-                        for (double x = box.MinPoint.X + p.OffsetX; x <= box.MaxPoint.X - p.OffsetX / 2; x += p.SpacingX)
-                            pts.Add(new Point3d(x, y, 0));
-                    break;
-
-                case LashingLocationMode.StarBoard:
-                    // P1 = góc Trên-Trái → phát triển xuống và sang phải
-                    for (double y = box.MaxPoint.Y - p.OffsetY; y >= box.MinPoint.Y + p.OffsetY / 2; y -= p.SpacingY)
-                        for (double x = box.MinPoint.X + p.OffsetX; x <= box.MaxPoint.X - p.OffsetX / 2; x += p.SpacingX)
-                            pts.Add(new Point3d(x, y, 0));
-                    break;
-
-                case LashingLocationMode.Center:
-                    // Gap #12: Dùng polygon centroid thay vì midpoint bounding box
-                    Point3d centroid = AutoCADGeometryHelper.GetPolygonCentroid(boundary);
-                    int     nX       = Math.Max(1, (int)Math.Floor((w - 2 * p.OffsetX) / p.SpacingX) + 1);
-                    int     nY       = Math.Max(1, (int)Math.Floor((h - 2 * p.OffsetY) / p.SpacingY) + 1);
-                    double  startX   = centroid.X - (nX - 1) / 2.0 * p.SpacingX;
-                    double  startY   = centroid.Y - (nY - 1) / 2.0 * p.SpacingY;
-                    for (int row = 0; row < nY; row++)
-                        for (int col = 0; col < nX; col++)
-                            pts.Add(new Point3d(startX + col * p.SpacingX, startY + row * p.SpacingY, 0));
-                    break;
+                System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Không tìm thấy entity nào để gom block.");
+                return null;
             }
 
-            return pts;
+            // 2. Điểm chèn = góc dưới-trái boundary.
+            //    VBA dùng p1 làm cả base point của block lẫn điểm insert → net dịch = 0.
+            //    Ta set Origin = basePt và insert tại basePt → geometry giữ nguyên tọa độ world.
+            Extents3d box    = boundary.GeometricExtents;
+            Point3d   basePt = box.MinPoint;
+
+            // 3. Tên block duy nhất "<PanelName>_L.H"
+            var    bt        = tr.GetObject(db.BlockTableId, OpenMode.ForWrite) as BlockTable;
+            string baseName  = presetName ??
+                ((string.IsNullOrWhiteSpace(p.PanelName) ? "PNL" : p.PanelName.Trim()) + "_L.H");
+            string finalName = ResolveUniqueBlockName(bt, baseName);
+
+            // 4. Tạo BlockTableRecord
+            var      btr   = new BlockTableRecord { Name = finalName, Origin = basePt };
+            ObjectId btrId = bt.Add(btr);
+            tr.AddNewlyCreatedDBObject(btr, true);
+
+            // 5. Deep clone entity vào block record (tương đương ActiveX CopyObjects)
+            var idColl = new ObjectIdCollection();
+            foreach (var id in ids) idColl.Add(id);
+            var mapping = new IdMapping();
+            db.DeepCloneObjects(idColl, btrId, mapping, false);
+
+            // 6. Insert 1 block reference tại basePt
+            var bref = new BlockReference(basePt, btrId);
+            modelSpace.AppendEntity(bref);
+            tr.AddNewlyCreatedDBObject(bref, true);
+
+            // 7. Xóa entity gốc (đã được clone vào block)
+            foreach (var id in ids)
+            {
+                try
+                {
+                    if (tr.GetObject(id, OpenMode.ForWrite) is Entity e && !e.IsErased) e.Erase();
+                }
+                catch { /* bỏ qua entity không xóa được */ }
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"{LOG_PREFIX} PackIntoBlock THÀNH CÔNG: block '{finalName}' gom {ids.Count} entity.");
+            return finalName;
+        }
+
+        /// <summary>Thu thập inner/outer circle (khớp bán kính) + dimension nằm trong boundary.</summary>
+        private static List<ObjectId> CollectLashingEntities(
+            LashingInputParams p, Polyline boundary, Transaction tr, BlockTableRecord modelSpace)
+        {
+            var       result   = new List<ObjectId>();
+            double    rInner   = p.HoleDiameter / 2.0;
+            double    rOuter   = p.ClearanceRadius;
+            Extents3d bbox      = boundary.GeometricExtents;
+            const double R_TOL = 0.5; // dung sai bán kính (mm)
+
+            // An toàn với proxy/custom entity: check RXClass TRƯỚC khi GetObject.
+            // Native code crash (bypass managed try/catch) nếu open proxy entity — xem SESSION_LOG.
+            var circleClass = AcRuntime.RXObject.GetClass(typeof(Circle));
+            var dimClass    = AcRuntime.RXObject.GetClass(typeof(Dimension));
+
+            foreach (ObjectId id in modelSpace)
+            {
+                if (!id.IsValid || id.IsErased) continue;
+                bool isCircleType = id.ObjectClass.IsDerivedFrom(circleClass);
+                bool isDimType    = id.ObjectClass.IsDerivedFrom(dimClass);
+                if (!isCircleType && !isDimType) continue;
+
+                Entity ent;
+                try { ent = tr.GetObject(id, OpenMode.ForRead) as Entity; }
+                catch { continue; }
+                if (ent == null || ent.IsErased) continue;
+
+                if (ent is Circle c)
+                {
+                    bool isInner = c.Layer == LashingInputParams.LAYER_INNER_HOLE  && Math.Abs(c.Radius - rInner) < R_TOL;
+                    bool isOuter = c.Layer == LashingInputParams.LAYER_OUTER_CLEAR && Math.Abs(c.Radius - rOuter) < R_TOL;
+                    if ((isInner || isOuter) && AutoCADGeometryHelper.IsInsidePolylineOrEdge(c.Center, boundary))
+                        result.Add(id);
+                }
+                else if (ent is Dimension dim && dim.Layer == LashingInputParams.LAYER_DIMENSION)
+                {
+                    try
+                    {
+                        Extents3d de = dim.GeometricExtents;
+                        var       mid = new Point3d((de.MinPoint.X + de.MaxPoint.X) / 2.0,
+                                                    (de.MinPoint.Y + de.MaxPoint.Y) / 2.0, 0);
+                        if (mid.X >= bbox.MinPoint.X && mid.X <= bbox.MaxPoint.X &&
+                            mid.Y >= bbox.MinPoint.Y && mid.Y <= bbox.MaxPoint.Y)
+                            result.Add(id);
+                    }
+                    catch { }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>Trả về tên block chưa tồn tại: baseName, baseName_2, baseName_3, …</summary>
+        private static string ResolveUniqueBlockName(BlockTable bt, string baseName)
+        {
+            if (!bt.Has(baseName)) return baseName;
+            for (int i = 2; i < 1000; i++)
+            {
+                string candidate = baseName + "_" + i;
+                if (!bt.Has(candidate)) return candidate;
+            }
+            return baseName + "_" + Guid.NewGuid().ToString("N").Substring(0, 6);
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -219,29 +351,177 @@ namespace MCG_CreateLashingHole.Services
         }
 
         // ─────────────────────────────────────────────────────────────
+        // FULL DIMENSIONING — port VBA AddContinuousDimensions
+        // Chuỗi dim liên tục dọc hàng dài nhất (ngang) và cột dài nhất (đứng),
+        // gồm mốc P1 + biên rect, bỏ đoạn trùng và đoạn 0.
+        // ─────────────────────────────────────────────────────────────
+        private static List<ObjectId> AddContinuousDimensions(
+            List<Point3d> points, Point3d originPt,
+            double rectMinX, double rectMaxX, double rectMinY, double rectMaxY,
+            string dimLayer, Transaction tr, BlockTableRecord space, Database db)
+        {
+            var created = new List<ObjectId>();
+            if (points == null || points.Count < 1) return created;
+
+            EnsureLayerExists(dimLayer, db, tr);
+            const double PLACEMENT_OFFSET = 150.0;
+
+            // 1) Phân loại điểm theo hàng (Y) và cột (X)
+            var rows = new Dictionary<string, List<Point3d>>();
+            var cols = new Dictionary<string, List<Point3d>>();
+            foreach (var pt in points)
+            {
+                string rk = CK(pt.Y), ck = CK(pt.X);
+                if (!rows.ContainsKey(rk)) rows[rk] = new List<Point3d>();
+                rows[rk].Add(pt);
+                if (!cols.ContainsKey(ck)) cols[ck] = new List<Point3d>();
+                cols[ck].Add(pt);
+            }
+
+            // 2) Tìm hàng/cột dài nhất
+            string longestRowKey = null, longestColKey = null;
+            int    maxRow = 0, maxCol = 0;
+            foreach (var kv in rows) if (kv.Value.Count > maxRow) { maxRow = kv.Value.Count; longestRowKey = kv.Key; }
+            foreach (var kv in cols) if (kv.Value.Count > maxCol) { maxCol = kv.Value.Count; longestColKey = kv.Key; }
+
+            // --- HORIZONTAL DIMENSIONS (dọc hàng dài nhất) ---
+            if (maxRow >= 1 && longestRowKey != null)
+            {
+                double longestRowY = rows[longestRowKey][0].Y;
+                double dimLineY    = longestRowY + PLACEMENT_OFFSET;
+
+                var xs = GetUniqueSorted(rows[longestRowKey].Select(pt => pt.X));
+                if (xs.Count >= 1)
+                {
+                    // Hố gần P1 nhất
+                    double closest = xs[0];
+                    double best    = -1;
+                    foreach (double x in xs)
+                    {
+                        double d = (x - originPt.X) * (x - originPt.X);
+                        if (best < 0 || d < best) { best = d; closest = x; }
+                    }
+
+                    // Dim đầu: P1 → hố gần nhất
+                    if (Math.Abs(originPt.X - closest) > 1e-6)
+                        created.Add(CreateAlignedDim(
+                            new Point3d(originPt.X, longestRowY, 0),
+                            new Point3d(closest,    longestRowY, 0),
+                            new Point3d((originPt.X + closest) / 2.0, dimLineY, 0),
+                            dimLayer, tr, space, db));
+
+                    // Chuỗi dim liên tục: [P1.X, rectMinX, rectMaxX] + xs
+                    var chainSrc = new List<double> { originPt.X, rectMinX, rectMaxX };
+                    chainSrc.AddRange(xs);
+                    var chain = GetUniqueSorted(chainSrc);
+                    for (int i = 0; i < chain.Count - 1; i++)
+                    {
+                        double a = chain[i], b = chain[i + 1];
+                        bool dup = (Math.Abs(a - originPt.X) < 1e-6 && Math.Abs(b - closest) < 1e-6) ||
+                                   (Math.Abs(b - originPt.X) < 1e-6 && Math.Abs(a - closest) < 1e-6);
+                        if (!dup && Math.Abs(a - b) > 1e-6)
+                            created.Add(CreateAlignedDim(
+                                new Point3d(a, longestRowY, 0),
+                                new Point3d(b, longestRowY, 0),
+                                new Point3d((a + b) / 2.0, dimLineY, 0),
+                                dimLayer, tr, space, db));
+                    }
+                }
+            }
+
+            // --- VERTICAL DIMENSIONS (dọc cột dài nhất) ---
+            if (maxCol >= 1 && longestColKey != null)
+            {
+                double longestColX = cols[longestColKey][0].X;
+                double dimLineX    = longestColX + PLACEMENT_OFFSET;
+
+                var ys = GetUniqueSorted(cols[longestColKey].Select(pt => pt.Y));
+                if (ys.Count >= 1)
+                {
+                    double closest = ys[0];
+                    double best    = -1;
+                    foreach (double y in ys)
+                    {
+                        double d = (y - originPt.Y) * (y - originPt.Y);
+                        if (best < 0 || d < best) { best = d; closest = y; }
+                    }
+
+                    if (Math.Abs(originPt.Y - closest) > 1e-6)
+                        created.Add(CreateAlignedDim(
+                            new Point3d(longestColX, originPt.Y, 0),
+                            new Point3d(longestColX, closest,    0),
+                            new Point3d(dimLineX, (originPt.Y + closest) / 2.0, 0),
+                            dimLayer, tr, space, db));
+
+                    var chainSrc = new List<double> { originPt.Y, rectMinY, rectMaxY };
+                    chainSrc.AddRange(ys);
+                    var chain = GetUniqueSorted(chainSrc);
+                    for (int i = 0; i < chain.Count - 1; i++)
+                    {
+                        double a = chain[i], b = chain[i + 1];
+                        bool dup = (Math.Abs(a - originPt.Y) < 1e-6 && Math.Abs(b - closest) < 1e-6) ||
+                                   (Math.Abs(b - originPt.Y) < 1e-6 && Math.Abs(a - closest) < 1e-6);
+                        if (!dup && Math.Abs(a - b) > 1e-6)
+                            created.Add(CreateAlignedDim(
+                                new Point3d(longestColX, a, 0),
+                                new Point3d(longestColX, b, 0),
+                                new Point3d(dimLineX, (a + b) / 2.0, 0),
+                                dimLayer, tr, space, db));
+                    }
+                }
+            }
+
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} AddContinuousDimensions: {created.Count} dim.");
+            return created;
+        }
+
+        private static ObjectId CreateAlignedDim(
+            Point3d p1, Point3d p2, Point3d dimLinePt, string dimLayer,
+            Transaction tr, BlockTableRecord space, Database db)
+        {
+            var dim = new AlignedDimension(p1, p2, dimLinePt, string.Empty, db.Dimstyle);
+            dim.Layer    = dimLayer;
+            dim.Dimscale = DIMSCALE; // set trên entity — tránh set db.Dimscale gây reactor crash
+            space.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+            return dim.ObjectId;
+        }
+
+        /// <summary>Distinct theo key "0.000" + sort tăng dần (khớp VBA GetUniqueSortedValuesFromCollection).</summary>
+        private static List<double> GetUniqueSorted(IEnumerable<double> values)
+        {
+            var map = new Dictionary<string, double>();
+            foreach (double v in values)
+            {
+                string k = CK(v);
+                if (!map.ContainsKey(k)) map[k] = v;
+            }
+            var list = map.Values.ToList();
+            list.Sort();
+            return list;
+        }
+
+        private static string CK(double c)
+            => c.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+
+        // ─────────────────────────────────────────────────────────────
         // Helpers
         // ─────────────────────────────────────────────────────────────
 
         private static ObjectId DrawCircle(Point3d center, double radius, string layer,
-            Transaction tr, BlockTableRecord space, Database db)
+            Transaction tr, BlockTableRecord space, Database db, bool markRed = false)
         {
-            D.Log($"    DrawCircle: new Circle()...");
             var circle = new Circle();
-            D.Log($"    DrawCircle: SetDatabaseDefaults...");
             circle.SetDatabaseDefaults(db);
-            D.Log($"    DrawCircle: Center={center.X:F0},{center.Y:F0}...");
             circle.Center = center;
-            D.Log($"    DrawCircle: Normal...");
             circle.Normal = Vector3d.ZAxis;
-            D.Log($"    DrawCircle: Radius={radius}...");
             circle.Radius = radius;
-            D.Log($"    DrawCircle: Layer={layer}...");
             circle.Layer  = layer;
-            D.Log($"    DrawCircle: AppendEntity...");
+            // markRed = lỗ va chạm không né được → tô đỏ (acRed = ColorIndex 1); còn lại ByLayer
+            if (markRed)
+                circle.ColorIndex = 1;
             space.AppendEntity(circle);
-            D.Log($"    DrawCircle: AddNewlyCreatedDBObject...");
             tr.AddNewlyCreatedDBObject(circle, true);
-            D.Log($"    DrawCircle: DONE objectId={circle.ObjectId}");
             return circle.ObjectId;
         }
 
