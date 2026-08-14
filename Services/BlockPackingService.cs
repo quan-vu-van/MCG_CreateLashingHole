@@ -149,6 +149,9 @@ namespace MCG_CreateLashingHole.Services
                 Point3d finalPt = candidate;
                 bool    markRed = collides;
                 if (collides) { stats.Collided++; stats.Red++; }
+                // Type B: outer ring cắt chính đường BOUNDARY (dù không đè structure) → cũng tô đỏ
+                else if (AutoCADGeometryHelper.DistanceToBoundary(candidate, boundary) < p.ClearanceRadius)
+                { markRed = true; stats.Red++; }
 
                 // Vẽ DUAL CIRCLE — inner ByLayer; outer tô đỏ nếu va chạm không né được
                 ObjectId innerId = DrawCircle(finalPt, radius, LashingInputParams.LAYER_INNER_HOLE,
@@ -182,6 +185,88 @@ namespace MCG_CreateLashingHole.Services
             System.Diagnostics.Debug.WriteLine(
                 $"{LOG_PREFIX} GenerateHoles THÀNH CÔNG: {innerIds.Count} lỗ, {adjusted.Count} điều chỉnh.");
             return innerIds;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // AUTO slope/concave conform — vẽ CHỈ lỗ mới ở vùng gap + dim CỤC BỘ
+        // (điểm #5: chỉ dim lỗ LỆCH lưới gốc, không dim lại cả cột như VBA)
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Vẽ các lỗ conform (chỉ lỗ MỚI ở vùng dốc/lõm) + dimension cục bộ giữa lỗ mới với nhau
+        /// và với seed. Trả về ObjectId inner đã tạo (để cộng vào tổng).
+        /// </summary>
+        public List<ObjectId> DrawConformHoles(
+            LashingInputParams p, Polyline boundary, List<Entity> structures,
+            List<GridEngineService.ConformFill> fills,
+            Transaction tr, BlockTableRecord space, Database db, out int addedCount)
+        {
+            addedCount = 0;
+            var innerIds = new List<ObjectId>();
+            if (fills == null || fills.Count == 0) return innerIds;
+
+            double radius = p.HoleDiameter / 2.0;
+            EnsureLayerExists(LashingInputParams.LAYER_INNER_HOLE,  db, tr);
+            EnsureLayerExists(LashingInputParams.LAYER_OUTER_CLEAR, db, tr);
+            EnsureLayerExists(LashingInputParams.LAYER_DIMENSION,   db, tr);
+
+            foreach (var fill in fills)
+            {
+                double prevY = fill.SeedY;
+                for (int i = 0; i < fill.Ys.Count; i++)
+                {
+                    double y = fill.Ys[i];
+                    var pt = new Point3d(fill.X, y, 0);
+
+                    // Lỗ conform đã né va chạm khi sinh; nếu vẫn kẹt (structure) hoặc cắt biên → tô đỏ
+                    bool markRed = structures != null && structures.Count > 0 &&
+                                   _collision.GetWorstCollision(pt, p.ClearanceRadius, structures).CollisionOccurred;
+                    if (!markRed && AutoCADGeometryHelper.DistanceToBoundary(pt, boundary) < p.ClearanceRadius)
+                        markRed = true;   // Type B: outer ring cắt boundary
+
+                    ObjectId innerId = DrawCircle(pt, radius, LashingInputParams.LAYER_INNER_HOLE,
+                        tr, space, db, markRed: false);
+                    DrawCircle(pt, p.ClearanceRadius, LashingInputParams.LAYER_OUTER_CLEAR,
+                        tr, space, db, markRed: markRed);
+                    innerIds.Add(innerId);
+                    addedCount++;
+
+                    // ⚑ CHẨN ĐOÁN TẠM: tô CYAN lỗ inner do conform tạo, để phân biệt với local-adjust.
+                    // (Gỡ sau khi xác nhận conform chạy đúng.)
+                    try { ((Circle)tr.GetObject(innerId, OpenMode.ForWrite)).ColorIndex = 4; } catch { }
+
+                    // Dim CỤC BỘ — ĐIỂM #5: CHỈ dim lỗ LỆCH hàng chuẩn (Deviated), không dim lỗ đúng lưới
+                    bool deviated = fill.Deviated != null && i < fill.Deviated.Count && fill.Deviated[i];
+                    if (deviated)
+                        AddVerticalDim(fill.X, prevY, y, tr, space, db);
+                    prevY = y;
+                }
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"{LOG_PREFIX} DrawConformHoles: +{addedCount} lỗ conform / {fills.Count} chuỗi.");
+            return innerIds;
+        }
+
+        /// <summary>Dim aligned dọc giữa 2 điểm cùng X (offset ra cạnh 150mm, Dimscale 25).</summary>
+        private static void AddVerticalDim(double x, double y1, double y2,
+            Transaction tr, BlockTableRecord space, Database db)
+        {
+            if (Math.Abs(y1 - y2) < 1.0) return;
+            try
+            {
+                var a  = new Point3d(x, y1, 0);
+                var b  = new Point3d(x, y2, 0);
+                var dl = new Point3d(x + 150.0, (y1 + y2) / 2.0, 0);
+                var dim = new AlignedDimension(a, b, dl, string.Empty, db.Dimstyle)
+                {
+                    Layer    = LashingInputParams.LAYER_DIMENSION,
+                    Dimscale = DIMSCALE
+                };
+                space.AppendEntity(dim);
+                tr.AddNewlyCreatedDBObject(dim, true);
+            }
+            catch { /* Dimstyle chưa sẵn sàng → bỏ dim, không chặn vẽ lỗ */ }
         }
 
         // ─────────────────────────────────────────────────────────────

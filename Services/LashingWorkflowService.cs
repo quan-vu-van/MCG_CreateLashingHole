@@ -220,6 +220,7 @@ namespace MCG_CreateLashingHole.Services
             List<ObjectId> innerIds;
             BlockPackingService.DrawStats stats;
             int gridCount;
+            string conformMsg = null;
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 try
@@ -230,16 +231,14 @@ namespace MCG_CreateLashingHole.Services
                     var space    = (BlockTableRecord)tr.GetObject(
                                        bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
-                    // Auto + Center mode: dùng polygon centroid làm effective center (cải tiến giữ lại)
-                    if (p.IsAutomaticMode && p.LocationMode == LashingLocationMode.Center)
-                        effCenter = AutoCADGeometryHelper.GetPolygonCentroid(boundary);
+                    // Lõi rải 1 panel (dùng chung cho single-panel & batch — GeneratePanelCore)
+                    innerIds = GeneratePanelCore(p, boundary, structs, keepOut,
+                        p1, p2, startOption, effCenter, skipCenterAdjust,
+                        rectMinX, rectMaxX, rectMinY, rectMaxY,
+                        tr, space, db, out stats, out gridCount, out int conformCount);
+                    if (conformCount > 0)
+                        conformMsg = $"\nAuto slope-conform: +{conformCount} hole(s).";
 
-                    var grid = _gridEngine.GenerateGrid(p, boundary, structs, keepOut,
-                        p1, p2, startOption, effCenter, skipCenterAdjust);
-                    gridCount = grid.Count;
-
-                    innerIds = _packing.DrawHolesWithDimensions(p, boundary, structs, keepOut,
-                        grid, p1, rectMinX, rectMaxX, rectMinY, rectMaxY, tr, space, db, out stats);
                     tr.Commit();
                 }
                 catch
@@ -260,6 +259,8 @@ namespace MCG_CreateLashingHole.Services
                 $"colliding(red)={stats.Red} -> resolve via local adjust]");
             if (structureIds.Count == 0)
                 ed.WriteMessage("\n! No structures selected -> nothing to avoid.");
+            if (conformMsg != null)
+                ed.WriteMessage(conformMsg);
 
             // Lỗ đã commit vào database. KẾT THÚC lệnh generate tại đây: khi lệnh trả về
             // "Command:" AutoCAD repaint toàn bộ nên lỗ + dimension CHẮC CHẮN hiển thị.
@@ -269,6 +270,255 @@ namespace MCG_CreateLashingHole.Services
             LashingWorkflowState.Set(boundaryId, structureIds, keepOut, p1, p2);
             ed.WriteMessage("\n-> Holes displayed. Continuing to special-area / adjustment...");
             System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === GENERATE DONE, chờ POST ===");
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // LÕI RẢI 1 PANEL — dùng chung single-panel (RunGenerate) & batch (BatchWorkflowService)
+        // ═════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Sinh lưới + AUTO conform + vẽ dual-circle + dimension cho 1 panel, trong transaction sẵn có.
+        /// KHÔNG prompt, KHÔNG mở/đóng transaction — caller lo. Tách nguyên hành vi PHASE-1 cũ (single-panel
+        /// gọi hàm này → không đổi hành vi). Trả innerIds; out stats/gridCount/conformCount để báo cáo.
+        /// </summary>
+        public List<ObjectId> GeneratePanelCore(
+            LashingInputParams p, Polyline boundary, List<Entity> structs, List<Line3d> keepOut,
+            Point3d p1, Point3d p2, string startOption, Point3d effCenter, bool skipCenterAdjust,
+            double rectMinX, double rectMaxX, double rectMinY, double rectMaxY,
+            Transaction tr, BlockTableRecord space, Database db,
+            out BlockPackingService.DrawStats stats, out int gridCount, out int conformCount)
+        {
+            // Auto + Center: dùng polygon centroid làm effective center (cải tiến giữ lại)
+            if (p.IsAutomaticMode && p.LocationMode == LashingLocationMode.Center)
+                effCenter = AutoCADGeometryHelper.GetPolygonCentroid(boundary);
+
+            var grid = _gridEngine.GenerateGrid(p, boundary, structs, keepOut,
+                p1, p2, startOption, effCenter, skipCenterAdjust);
+            gridCount = grid.Count;
+
+            // ── AUTO slope/concave CONFORM (chỉ auto mode; cột phẳng gate loại → nguyên vẹn) ──
+            var drawGrid = grid;
+            List<GridEngineService.ConformFill> fills = null;
+            if (p.IsAutomaticMode)
+            {
+                fills = _gridEngine.ConformColumns(grid, p, boundary, structs, keepOut,
+                    out var keptGrid, out _);
+                drawGrid = keptGrid;
+            }
+
+            var innerIds = _packing.DrawHolesWithDimensions(p, boundary, structs, keepOut,
+                drawGrid, p1, rectMinX, rectMaxX, rectMinY, rectMaxY, tr, space, db, out stats);
+
+            conformCount = 0;
+            if (fills != null && fills.Count > 0)
+            {
+                var conformIds = _packing.DrawConformHoles(
+                    p, boundary, structs, fills, tr, space, db, out conformCount);
+                innerIds.AddRange(conformIds);
+            }
+            return innerIds;
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // BATCH MULTI-PANEL — MCG_LH_BATCH (chỉ AUTO mode; tùy chọn thêm, không đụng single-panel)
+        // ═════════════════════════════════════════════════════════════
+
+        /// <summary>1 panel trong batch: boundary + loại P/C/S.</summary>
+        private class PanelJob
+        {
+            public ObjectId BoundaryId;
+            public LashingLocationMode Mode;
+        }
+
+        /// <summary>Bật/tắt cross-panel adjacency (GĐ3) — để cô lập rủi ro khi cần (đổi false để tắt).</summary>
+        private static readonly bool BATCH_ADJACENCY_ENABLED = true;
+
+        /// <summary>
+        /// Rải lỗ đồng thời NHIỀU panel: thu thập từng boundary + gán P/C/S, rồi tự động
+        /// generate + local-adjust + đóng block cho từng panel. Chỉ AUTO mode. Tái dùng
+        /// GeneratePanelCore/LocalAdjustRedHoles/PackIntoBlock — KHÔNG đụng flow single-panel.
+        /// </summary>
+        public void RunBatchGenerate()
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+            var ed = doc.Editor;
+            var db = doc.Database;
+            var p  = LashingParamsStore.Current ?? new LashingInputParams();
+
+            if (!p.IsAutomaticMode)
+            {
+                ed.WriteMessage("\nBatch multi-panel requires AUTOMATIC mode (enable it in the palette).");
+                return;
+            }
+
+            ed.WriteMessage("\n=== MCG LASHING HOLE — BATCH (multi-panel) ===");
+
+            // ── Pha A: thu thập panel (boundary + P/C/S) ──
+            var jobs = new List<PanelJob>();
+            while (true)
+            {
+                ed.WriteMessage($"\n--- Select boundary for panel #{jobs.Count + 1} (Esc/Enter to finish) ---");
+                ObjectId bId = PromptBoundary(ed, db);
+                if (bId.IsNull) break;
+                if (jobs.Any(j => j.BoundaryId == bId)) { ed.WriteMessage("\nPanel already selected, skipped."); continue; }
+
+                string mode = Keyword(ed, "\nPanel type? [P/C/S]", "C", "P", "C", "S");
+                if (mode == null) break;
+                var lm = mode == "P" ? LashingLocationMode.PortSide
+                       : mode == "S" ? LashingLocationMode.StarBoard
+                       :               LashingLocationMode.Center;
+                jobs.Add(new PanelJob { BoundaryId = bId, Mode = lm });
+                ed.WriteMessage($"\n-> Panel #{jobs.Count}: {lm}.");
+
+                string more = Keyword(ed, "\nSelect another panel?", "Yes", "Yes", "No");
+                if (more != "Yes") break;
+            }
+
+            if (jobs.Count == 0) { ed.WriteMessage("\nNo panels selected. Cancelled."); return; }
+            ed.WriteMessage($"\n-> {jobs.Count} panel(s) collected. Processing...");
+
+            // ── Pha B: xử lý từng panel ──
+            int totalHoles = 0, totalBlocks = 0;
+            for (int i = 0; i < jobs.Count; i++)
+            {
+                try { ProcessBatchPanel(ed, db, p, jobs[i], i + 1, jobs, ref totalHoles, ref totalBlocks); }
+                catch (Exception ex) { ed.WriteMessage($"\nPanel #{i + 1} error: {ex.Message}"); }
+            }
+
+            ed.Regen(); ed.UpdateScreen();
+            ed.WriteMessage($"\n=== BATCH DONE: {jobs.Count} panel(s), {totalHoles} hole(s), {totalBlocks} block(s). ===");
+        }
+
+        /// <summary>Xử lý 1 panel trong batch: structures → keep-out → generate → local-adjust → đóng block.</summary>
+        private void ProcessBatchPanel(Editor ed, Database db, LashingInputParams basP, PanelJob job, int idx,
+            List<PanelJob> allJobs, ref int totalHoles, ref int totalBlocks)
+        {
+            Extents3d box;
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var b = (Polyline)tr.GetObject(job.BoundaryId, OpenMode.ForRead);
+                box = b.GeometricExtents;
+                tr.Commit();
+            }
+
+            var structureIds = SelectStructuresBatch(ed, db, job, box);          // GĐ2: cross full-span
+            var keepOut      = BuildAdjacencyKeepOut(ed, db, job, box, allJobs);  // GĐ3: adjacency (rỗng nếu tắt)
+
+            var (p1, p2)     = GetSmartP1P2(db, job.BoundaryId, box, job.Mode);
+            double rMinX = Math.Min(p1.X, p2.X), rMaxX = Math.Max(p1.X, p2.X);
+            double rMinY = Math.Min(p1.Y, p2.Y), rMaxY = Math.Max(p1.Y, p2.Y);
+            var    effCenter   = new Point3d((rMinX + rMaxX) / 2.0, (rMinY + rMaxY) / 2.0, 0);
+            // AUTO mode LUÔN rải từ tâm (khớp single-panel auto) → cột thẳng hàng giữa các panel kề.
+            // P/C/S chỉ đổi P1 tham chiếu (dimension) qua GetSmartP1P2, KHÔNG đổi gốc rải.
+            string startOption = "Center";
+
+            var pp = ClonePanelParams(basP, job.Mode);   // param riêng, mode = P/C/S của panel
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                try
+                {
+                    var boundary = (Polyline)tr.GetObject(job.BoundaryId, OpenMode.ForRead);
+                    var structs  = OpenStructures(tr, structureIds);
+                    var bt       = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var space    = (BlockTableRecord)tr.GetObject(
+                                       bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                    var innerIds = GeneratePanelCore(pp, boundary, structs, keepOut,
+                        p1, p2, startOption, effCenter, skipCenterAdjust: false,
+                        rMinX, rMaxX, rMinY, rMaxY, tr, space, db, out _, out _, out _);
+
+                    int moved = LocalAdjustRedHoles(pp, boundary, structs, keepOut, tr, space, db);
+
+                    string baseName = (string.IsNullOrWhiteSpace(pp.PanelName) ? "PNL" : pp.PanelName.Trim())
+                                      + $"_{idx}_L.H";
+                    string packed = _packing.PackIntoBlock(pp, boundary, tr, db, space, baseName);
+
+                    tr.Commit();
+                    totalHoles += innerIds.Count;
+                    if (packed != null) totalBlocks++;
+                    ed.WriteMessage($"\nPanel #{idx} ({job.Mode}): {innerIds.Count} hole(s), " +
+                                    $"structs={structureIds.Count}, keepOut={keepOut.Count}, adjust={moved}, block='{packed}'.");
+                }
+                catch { tr.Abort(); throw; }
+            }
+        }
+
+        /// <summary>
+        /// Chọn structures cho 1 panel BATCH = BBOX-overlap (đúng như single-panel SelectStructuresByCrossing).
+        /// Dữ liệu so sánh V8 (chữ thập) vs V8.1 (bbox single-panel): bbox né cả thanh góc nhỏ → 0 va chạm,
+        /// còn chữ thập bỏ sót → 4 va chạm. bbox-overlap tự loại panel XA (không chồng) và tự gồm cấu kiện
+        /// cạnh-chung của panel KỀ (adjacency mong muốn) → batch chặt ngang single-panel.
+        /// </summary>
+        private static List<ObjectId> SelectStructuresBatch(Editor ed, Database db, PanelJob job, Extents3d box)
+            => SelectStructuresByCrossing(ed, db, job.BoundaryId, box);
+
+        /// <summary>
+        /// GĐ3: dựng keep-out cho panel này từ nẹp full-span của CÁC panel kề (tái dùng
+        /// CreateVirtualKeepOutZones — đúng logic adjacent hiện có). Kề NGANG (trái/phải) → nẹp DỌC
+        /// của panel kia; kề DỌC (trên/dưới) → nẹp NGANG. Panel chéo/chồng → bỏ. Tắt qua BATCH_ADJACENCY_ENABLED.
+        /// </summary>
+        private List<Line3d> BuildAdjacencyKeepOut(
+            Editor ed, Database db, PanelJob job, Extents3d box, List<PanelJob> allJobs)
+        {
+            var keepOut = new List<Line3d>();
+            if (!BATCH_ADJACENCY_ENABLED) return keepOut;
+
+            double aMinX = box.MinPoint.X, aMaxX = box.MaxPoint.X;
+            double aMinY = box.MinPoint.Y, aMaxY = box.MaxPoint.Y;
+
+            foreach (var other in allJobs)
+            {
+                if (other == job) continue;
+
+                Extents3d ob;
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var b = tr.GetObject(other.BoundaryId, OpenMode.ForRead) as Polyline;
+                    if (b == null) { tr.Commit(); continue; }
+                    ob = b.GeometricExtents;
+                    tr.Commit();
+                }
+
+                bool xOverlap = aMaxX >= ob.MinPoint.X && aMinX <= ob.MaxPoint.X;
+                bool yOverlap = aMaxY >= ob.MinPoint.Y && aMinY <= ob.MaxPoint.Y;
+                bool horizAdj = yOverlap && !xOverlap;   // kề trái/phải → nẹp DỌC của other
+                bool vertAdj  = xOverlap && !yOverlap;   // kề trên/dưới → nẹp NGANG của other
+                if (!horizAdj && !vertAdj) continue;
+
+                var otherStructIds = SelectStructuresBatch(ed, db, other, ob);
+                if (otherStructIds.Count == 0) continue;
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var ents = OpenStructures(tr, otherStructIds);
+                    var zones = horizAdj
+                        ? _collision.CreateVirtualKeepOutZones(ents, aMinY, aMaxY, isVertical: true)
+                        : _collision.CreateVirtualKeepOutZones(ents, aMinX, aMaxX, isVertical: false);
+                    keepOut.AddRange(zones);
+                    tr.Commit();
+                }
+            }
+            return keepOut;
+        }
+
+        /// <summary>Nhân bản params cho 1 panel, ghi đè LocationMode = P/C/S, auto = true.</summary>
+        private static LashingInputParams ClonePanelParams(LashingInputParams s, LashingLocationMode mode)
+        {
+            return new LashingInputParams
+            {
+                HoleDiameter    = s.HoleDiameter,
+                ClearanceRadius = s.ClearanceRadius,
+                OffsetX         = s.OffsetX,
+                OffsetY         = s.OffsetY,
+                SpacingX        = s.SpacingX,
+                SpacingY        = s.SpacingY,
+                PanelName       = s.PanelName,
+                LocationMode    = mode,
+                IsAutomaticMode = true,
+                IsCheckAdjacent = s.IsCheckAdjacent
+            };
         }
 
         // ═════════════════════════════════════════════════════════════

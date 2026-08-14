@@ -90,6 +90,10 @@ namespace MCG_CreateLashingHole.Commands
             doc?.SendStringToExecute("MCG_LH_POST ", true, false, true);
         }
 
+        /// <summary>Batch multi-panel (chỉ AUTO): quét nhiều boundary + gán P/C/S → rải lỗ tất cả.</summary>
+        [CommandMethod("MCG_LH_BATCH", CommandFlags.Modal)]
+        public void RunBatch() => SafeRun(() => new LashingWorkflowService().RunBatchGenerate());
+
         /// <summary>Audit spacing report — chọn boundary rồi báo cáo ra command line</summary>
         [CommandMethod("MCG_LH_AUDIT", CommandFlags.Modal)]
         public void RunSpacingAudit() => SafeRun(() => new LashingWorkflowService().RunSpacingAudit());

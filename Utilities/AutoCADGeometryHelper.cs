@@ -280,5 +280,33 @@ namespace MCG_CreateLashingHole.Utilities
 
         public static double DistanceBetweenPoints(Point3d p1, Point3d p2)
             => Math.Sqrt(Math.Pow(p2.X - p1.X, 2) + Math.Pow(p2.Y - p1.Y, 2));
+
+        /// <summary>
+        /// Khoảng cách NGẮN NHẤT từ điểm tới đường boundary (mọi cạnh). Nếu &lt; clearance thì
+        /// outer ring của lỗ cắt qua biên (Type B) — dùng để đánh dấu đỏ / kiểm tra.
+        /// </summary>
+        public static double DistanceToBoundary(Point3d pt, Polyline boundary)
+        {
+            double best = double.MaxValue;
+            int n = boundary.NumberOfVertices;
+            for (int i = 0; i < n; i++)
+            {
+                Point2d a = boundary.GetPoint2dAt(i);
+                Point2d b = boundary.GetPoint2dAt((i + 1) % n);
+                double d = DistPointToSegment(pt.X, pt.Y, a.X, a.Y, b.X, b.Y);
+                if (d < best) best = d;
+            }
+            return best;
+        }
+
+        private static double DistPointToSegment(double px, double py, double ax, double ay, double bx, double by)
+        {
+            double dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+            if (l2 < 1e-12) return Math.Sqrt((px - ax) * (px - ax) + (py - ay) * (py - ay));
+            double t = ((px - ax) * dx + (py - ay) * dy) / l2;
+            if (t < 0) t = 0; else if (t > 1) t = 1;
+            double cx = ax + t * dx, cy = ay + t * dy;
+            return Math.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+        }
     }
 }

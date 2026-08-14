@@ -1,3 +1,213 @@
+## Session 2026-08-14 23:30 — 💡 ĐỀ XUẤT tương lai cho BATCH (dựa cấu hình panel thật)
+
+> Ghi lại để triển khai sau. Bối cảnh thật (V8–V10): panel là các CỤM P/C/S xếp chồng theo Y (P trên / C giữa / S dưới), nhiều cụm cạnh nhau theo X. Batch hiện đạt: 0 va chạm, cột ≈ thẳng hàng (35/39 khớp ≤1mm), còn 4 cột 1 panel lệch 109mm (centroid vs midpoint / mode).
+
+### 1. Common grid origin per cluster (align TUYỆT ĐỐI) — ưu tiên cao
+- Vấn đề: mỗi panel dùng effCenter riêng → Center-mode dùng centroid → panel bất đối xứng lệch ~109mm khỏi P/S (midpoint).
+- Đề xuất: tính **MỘT gốc lưới (X0,Y0) cho cả cụm** (vd từ panel reference/lớn nhất hoặc tâm bbox cụm), rải MỌI panel **snap vào lưới chung** (X=X0+k·spacingX, Y=Y0+m·spacingY). → cột VÀ hàng liên tục xuyên cụm. Đúng mục tiêu "reference panel kề để thẳng hàng".
+
+### 2. Auto-gán P/C/S theo vị trí panel — giảm lỗi tay
+- User đã nêu quy ước: **P = Y cao nhất, S = Y thấp nhất, C = giữa**. Batch có thể tự sort panel theo Y trong cụm và **auto-gán P/C/S** (cho phép override). Tránh mode-mismatch (nghi là 1 nguyên nhân 109mm).
+
+### 3. Row-alignment cho cụm cạnh nhau (theo X)
+- User đặt nhiều cụm cạnh nhau. Mở rộng "common grid" sang trục Y để **hàng** thẳng hàng giữa panel kề ngang → cả sàn thành 1 lưới liên tục.
+
+### 4. Adjacency = liên tục lưới, không chỉ keep-out
+- User định nghĩa mục đích adjacency là ĐỂ THẲNG HÀNG. Ngoài keep-out va chạm, để adjacency **chia sẻ pha lưới** qua cạnh chung (lỗ nối tiếp qua khe cùng bước).
+
+### 5. Cleanup
+- Gỡ **cyan diagnostic** (lỗ conform → về ByLayer) khi chốt.
+
+---
+
+## Session 2026-08-14 22:57 — 🐛 FIX batch cột lệch giữa panel: startOption phải "Center" (khớp single-panel auto)
+
+### Triệu chứng (user, V9: cụm single X-lớn vs cụm batch X-nhỏ)
+- Cột lashing hole trong batch LỆCH giữa 3 panel. Mục tiêu: cột (và hàng) thẳng hàng giữa panel kề như single-panel auto.
+
+### Nguyên nhân
+- Single-panel AUTO luôn `startOption="Center"` (mọc từ tâm) cho MỌI mode. Batch của tôi đặt `startOption = Center?"Center":"P1"` → **P/S mọc từ P1 (góc), C mọc từ tâm** → gốc cột khác → lệch.
+- Bằng chứng V9: histogram X xen kẽ 142/71 (P+S trùng cột = 142; C lệch = 71).
+
+### Sửa
+- `ProcessBatchPanel`: `startOption = "Center"` luôn (batch chỉ auto). P/C/S chỉ đổi P1 tham chiếu (dimension) qua GetSmartP1P2, KHÔNG đổi gốc rải. → batch grid-growth === single-panel auto → cột thẳng hàng.
+- Build PASS (`MCG_LashingHole_20260814_225720.dll`).
+
+### Lưu ý phụ (chờ xác nhận)
+- effCenter: Center mode dùng centroid, P/S dùng rect-midpoint (giống single-panel). Nếu panel bất đối xứng (centroid.X ≠ midpoint.X) → C vẫn lệch nhẹ. Nhưng vấn đề này single-panel cũng có → nếu single-panel thẳng hàng thì batch cũng vậy.
+
+---
+
+## Session 2026-08-14 22:31 — 🔧 Batch structure: đổi CHỮ THẬP → BBOX (khớp single-panel)
+
+### So sánh V8 (batch) vs V8.1 (single-panel, cùng 3 panel)
+- V8 batch: 1432 lỗ, **4 va chạm** (thanh góc nhỏ). V8.1 single: 1465 lỗ, **0 va chạm**.
+- Root: single-panel chọn structure BBOX → né cả thanh góc nhỏ; batch (GĐ2) chọn CHỮ THẬP full-span → bỏ sót → 4 va chạm. Tức chữ thập KÉM chặt hơn single-panel.
+
+### Sửa
+- `SelectStructuresBatch` → delegate `SelectStructuresByCrossing` (BBOX, y single-panel). bbox-overlap tự loại panel xa + tự gồm cấu kiện cạnh-chung panel kề (adjacency ngầm). Chữ thập (GĐ2) bỏ — thừa & thiếu sót.
+- Adjacency (GĐ3) vẫn BẬT (giá trị thêm; nếu over-constrain thì tắt cờ).
+- Build PASS (`MCG_LashingHole_20260814_223100.dll`).
+
+### Cần validate
+- Re-run batch → export → kỳ vọng **0 va chạm** khớp single-panel.
+
+---
+
+## Session 2026-08-14 21:50 — ✨ FEATURE: BATCH multi-panel (4 GĐ, chỉ AUTO, additive)
+
+### Yêu cầu
+- Lựa chọn thêm cho AUTO mode: quét NHIỀU boundary + gán P/C/S → rải lỗ tất cả panel. Structure qua chữ thập full-span. Cross-panel adjacency. Không đụng single-panel.
+
+### Đã làm (4 giai đoạn, build sạch mỗi GĐ)
+- **GĐ1a:** trích `LashingWorkflowService.GeneratePanelCore(...)` (grid+conform+draw) — single-panel `RunGenerate` gọi nó → KHÔNG đổi hành vi.
+- **GĐ1b:** `PanelJob` + `RunBatchGenerate` (thu thập boundary+P/C/S loop → mỗi panel: structures → keepOut → GeneratePanelCore → LocalAdjustRedHoles → PackIntoBlock) + lệnh `MCG_LH_BATCH`. Tái dùng PromptBoundary/Keyword/GetSmartP1P2/OpenStructures.
+- **GĐ2:** `SelectStructuresBatch` = chọn cơ cấu mà **chữ thập tâm** (hàng Y=crossY cắt nẹp dọc, cột X=crossX cắt nẹp ngang) cắt qua → full-span, loại nẹp ngắn + nẹp panel hàng xóm. Dùng tâm bbox cho mọi mode (bắt cả near-full-span).
+- **GĐ3:** `BuildAdjacencyKeepOut` — kề ngang (Y-overlap,!X)→nẹp dọc other; kề dọc (X-overlap,!Y)→nẹp ngang other; qua `CreateVirtualKeepOutZones` sẵn có. **Cờ `BATCH_ADJACENCY_ENABLED`** (static readonly) để tắt nếu lỗi.
+- **GĐ4:** nút palette "▶▶ BATCH (multi-panel)" → dispatch `MCG_LH_BATCH`.
+- Build PASS (`MCG_LashingHole_20260814_215038.dll`), 0 warning. Cyan diagnostic vẫn bật (chờ validate).
+
+### An toàn
+- Single-panel (`MCG_LH_RUN`/POST) chỉ khác: gọi `GeneratePanelCore` (extract-method) → cần export 1 panel đơn xác nhận không đổi.
+- Batch = lệnh/method riêng. Adjacency có công tắc.
+
+### Cần validate (runtime, user)
+- Chạy `MCG_LH_BATCH` trên bản vẽ nhiều panel → export từng panel → collisioncheck: flat giữ nguyên, structure đúng full-span, adjacency keep-out đúng, 0 va chạm.
+- Nếu adjacency sai → đổi `BATCH_ADJACENCY_ENABLED=false` build lại, batch vẫn chạy độc lập.
+
+---
+
+## Session 2026-08-14 17:57 — 🐛 FIX ngưỡng gap: bắt gap "một phần" ở góc/notch (đáy panel vuông)
+
+### Triệu chứng (user, V7 panel vuông Center mode)
+- Cạnh trên conform OK, cạnh dưới "không regenerate".
+
+### Nguyên nhân (profile top/bottom V7)
+- Cột MÉP (X33776, 46046): **gapBot=284** nhưng **gapTop=25**. Không phải bất đối xứng logic — mà ngưỡng `spacing*0.5 = 300` (spacing 600) **bỏ sót 284**. Đỉnh gap 25 vốn OK. Cột giữa gap 0.
+- Cột mép gần góc notch có gap "một phần" (< nửa spacing) → cần lấp nhưng bị ngưỡng chặn.
+
+### Sửa
+- `AddConformRun`: ngưỡng dương đổi `spacing*0.5` → **`MIN_EDGE_DISTANCE_FOR_GAP` (200)**. Bắt gap 284; cột phẳng gap≈0 vẫn bỏ. Bỏ hằng `CONFORM_GAP_FACTOR`.
+- Panel dốc: giờ conform còn ĐẦY ĐỦ hơn (bắt cả cột gap 200–300 trước bị sót).
+- Build PASS (`MCG_LashingHole_20260814_175752.dll`). V7: 0 lỗ cắt biên (fix boundary trước OK). Cyan diagnostic vẫn bật.
+
+---
+
+## Session 2026-08-14 15:18 — ✅ Boundary thành ràng buộc VA CHẠM (engine né cả biên)
+
+### User làm rõ thiết kế
+- offset(150) & clearance(75) đều là BIẾN palette, không phải tiêu chí. **Tiêu chí rõ ràng = VA CHẠM outer ring (bán kính = ClearanceRadius) với STRUCTURE + BIÊN.** Trước bỏ sót vì code tin luật lùi 150 thay vì check va chạm thật.
+
+### Đã làm
+- `GridEngineService.Collides`: thêm nhánh **`DistanceToBoundary(pt) < _clearance`** → engine rải/conform giờ **né cả BIÊN** (không chỉ structure). Dùng biến `_clearance`, không hardcode.
+- Kết hợp với: flag đỏ (DrawHoles/DrawConform dùng `p.ClearanceRadius`) + conform neg-gap (`_clearance − offsetY`). Tất cả biến-based → tự thích ứng khi user đổi 150/75.
+- offset vẫn là ĐÍCH đặt lỗ (anchor = biên + offset); va chạm structure+biên là RÀNG BUỘC.
+- Build PASS (`MCG_LashingHole_20260814_151818.dll`).
+
+### An toàn
+- Panel phẳng: lỗ ở offset 150 → cách biên 150 > clearance 75 → không "va chạm biên" → không đổi.
+
+---
+
+## Session 2026-08-14 14:50 — ✅ Conform dốc OK (V6) + xử lý Type B (cắt boundary)
+
+### V6 (build collision-gate 142904) — TỐT
+- Dải đáy dốc conform ĐỀU: gapBelow=50 cho hầu hết cột X62814→70889 (cyan bám biên). User OK.
+
+### 2 case user nêu
+- **Type A** (cột cắt border nhiều lần): để user sửa (đúng nguyên tắc đã chốt). Không xử lý.
+- **Type B** (outer ring cắt boundary nhưng KHÔNG đỏ/không lùi): collision chỉ check STRUCTURE, chưa check khoảng cách tới BOUNDARY. V6 có 3 lỗ: (64854,2883) d=28.9 [đáy, gap −121]; (70889,4125/4615) [cạnh phải].
+
+### Sửa
+- `AutoCADGeometryHelper.DistanceToBoundary(pt, boundary)`: khoảng cách ngắn nhất tới biên.
+- `AddConformRun`: gate thêm nhánh **gap ÂM** (`gap < clearance − offset = −75`) → lỗ đáy quá gần biên cũng conform (kéo về anchor). Fix ca 64854.
+- `DrawHolesWithDimensions` + `DrawConformHoles`: **tô ĐỎ lỗ có DistanceToBoundary < clearance** (Type B) → nhất quán, user thấy để sửa. Ca cạnh phải (70889) sẽ đỏ (chờ row-conform tương lai).
+- Build PASS (`MCG_LashingHole_20260814_145019.dll`). Cyan diagnostic vẫn bật.
+
+---
+
+## Session 2026-08-14 14:11 — 🔬 CHẨN ĐOÁN: conform CÓ chạy nhưng bị structure chặn + lẫn local-adjust
+
+### Bằng chứng (V4, build gap-gate 135632)
+- V4 KHÁC V3 (X62214 3415→3127, X65549 3415→3107, n +1) → **conform CÓ chạy** với gate GAP mới.
+- NHƯNG một số cột (X66249 gap 337) vẫn không đổi: anchor = biên+offset(150) rơi **trúng thanh 26B1F** (structure chạy ~100–150mm trong biên, bám dốc) → hole retreat lên (giới hạn maxRetreat ~170) → không đặt được lỗ đáy sạch.
+- User cảm giác "chỉ local-adjust": vì conform một phần + local-adjust chạy sau làm rối.
+
+### Nhận định gốc
+- Ràng buộc đáy THẬT ở vùng dốc là **STRUCTURE 26B1F**, không phải mép boundary. Conform về biên+offset đặt lỗ vào chỗ có structure → retreat thất thường.
+
+### Đã làm (chẩn đoán)
+- `DrawConformHoles`: **tô CYAN (ColorIndex 4) lỗ inner do conform tạo** — để nhìn tách khỏi local-adjust. TẠM, gỡ sau.
+- Build PASS (`MCG_LashingHole_20260814_141136.dll`).
+
+### Bước sau (chờ user xác nhận cyan)
+- Nếu cyan lấp đúng dốc → giữ, gỡ màu. Nếu cyan thưa/không tới đáy → đổi ANCHOR sang bám structure (clearance từ 26B1F) thay vì biên, + đảm bảo local-adjust không phá cột đã conform.
+
+---
+
+## Session 2026-08-14 13:56 — 🐛 FIX gate conform: dùng GAP thật, không dùng độ dốc boundary
+
+### Triệu chứng (user, V3 + screenshot)
+- Area B (đáy dốc) NHIỀU cột không được conform → tam giác trống, giống bản trước.
+
+### Nguyên nhân (profile per-cột V3)
+- Gate v2 dùng `edgeY − bmin.Y` (độ dốc boundary). Cột X62214: boundary thấp (2828, gần đáy panel) → gate tưởng "không dốc" (95 < 250) → BỎ QUA. Nhưng lỗ đáy thật của cột (3415) bị **structure đẩy lên** → còn **gap 437mm** so anchor 2978 → PHẢI conform. Gate sai → bỏ sót các cột gap 337–437.
+
+### Sửa
+- `AddConformRun`: đổi gate `edgeY − flatEdgeY` → **GAP thật `outerY − anchor > spacing*0.5`** (giống tinh thần v1 nhưng giữ delete+relay của v2). Cột phẳng: lỗ đáy ≈ anchor → gap≈0 → vẫn bỏ qua (an toàn). Bỏ param `flatEdgeY`.
+- Build PASS (`MCG_LashingHole_20260814_135632.dll`).
+
+### Còn lại
+- Cột gap nhỏ (~113mm, vd X68249) vẫn skip (ngưỡng 0.5 spacing) — tune sau nếu cần.
+- **Điểm #3 (user)**: StarBoard → P1 góc trên-trái, thiếu dim "150 to P1" từ lỗ trên cùng cột dài nhất. CHƯA xử lý — cần xem lại `AddContinuousDimensions` cho StarBoard + xác nhận LocationMode user dùng.
+- Area A: là local-adjust (không phải bug).
+
+---
+
+## Session 2026-08-14 13:26 — 🔧 FEATURE v2: AUTO conform = XÓA đuôi + RẢI LẠI (thay add-only)
+
+### Vì sao v1 (add-only) chưa đạt (user feedback)
+- Auto vẫn = "loại lỗ ngoài biên + local-adjust dịch" → dải đáy lộn xộn, không phải đường viền dốc sạch. Add-only chỉ THÊM (ngưỡng), KHÔNG xóa đuôi lộn xộn → chưa đạt.
+
+### v2 (đúng ý tưởng gốc: relay-per-column như special-area, tự động)
+- `GridEngineService.ConformColumns` (thay `ComputeColumnConformFill`): gom cột → mỗi cột bắn tia lên/xuống tới giao boundary đầu.
+  - **GATE**: chỉ động vào cột có cạnh XIÊN/LÕM đáng kể (`|edgeY − flat_bbox_edge| > spacing*0.5`). **Cột phẳng → bỏ qua → generate phẳng NGUYÊN VẸN.**
+  - Cột dốc: chọn seed interior sạch → **XÓA đuôi lỗ phẳng** (vượt seed về phía cạnh) → **RẢI LẠI** đường conform tới `giao − offset` (né va chạm qua RegenerateSeedLineSpecial).
+  - Trả `fills` + `out keptGrid` (lưới đã bỏ đuôi) + đánh dấu `Deviated` (lỗ lệch hàng chuẩn).
+- `BlockPackingService.DrawConformHoles`: vẽ lỗ conform; **dim CỤC BỘ CHỈ cho lỗ `Deviated`** (điểm #5 — không dim lỗ đúng lưới).
+- `RunGenerate`: auto → ConformColumns TRƯỚC khi vẽ → DrawHolesWithDimensions(keptGrid) → DrawConformHoles(fills). Manual: nguyên vẹn.
+- Build PASS (`MCG_LashingHole_20260814_132607.dll`).
+
+### An toàn
+- Manual mode & cột phẳng: KHÔNG chạy/không đụng. Special-area tay giữ làm fallback.
+
+### Cần validate + tune (thẳng)
+- **Gate theo BOUNDARY-slope**: cột gần cạnh gần-phẳng nhưng va chạm STRUCTURE (vd 26B1F chạy ~100mm trong biên) KHÔNG được conform → vẫn để local-adjust xử lý. Đây là giới hạn có chủ ý của v2; ngưỡng `spacing*0.5` là knob.
+- **Test**: chạy AUTO trên panel dốc FRESH → export → `collisioncheck` (phải 0 va chạm) + kiểm flat giữ nguyên + dải dốc sạch. Rồi tune gate.
+
+---
+
+## Session 2026-08-14 12:39 — 🧪 FEATURE (first cut): AUTO slope/concave conform theo cột
+
+### Mục tiêu (hướng B, 5 điểm user chốt)
+- Sau generate phẳng, AUTO mode: mỗi cột bắn tia lên/xuống tới boundary, lấp thêm lỗ bám dốc/lõm. Giữ generate phẳng nguyên vẹn; special-area tay làm fallback; dim chỉ cho lỗ mới.
+
+### Đã làm
+- `GridEngineService`: thêm struct `ConformFill` + `ComputeColumnConformFill` + `AddConformRun`. Gom điểm theo cột; mỗi cột bắn tia (TryRayBoundaryIntersection) tới giao ĐẦU TIÊN; nếu gap > spacing*0.5 thì sinh lỗ mới qua `RegenerateSeedLineSpecial` (né va chạm). Chỉ trả lỗ MỚI.
+- `BlockPackingService`: `DrawConformHoles` vẽ lỗ mới + `AddVerticalDim` dim CỤC BỘ (điểm #5, chỉ lỗ lệch lưới).
+- `LashingWorkflowService.RunGenerate`: gọi conform SAU DrawHolesWithDimensions, **chỉ `if (p.IsAutomaticMode)`**, có Stopwatch (in detect/total ms).
+- Build PASS (`MCG_LashingHole_20260814_123923.dll`).
+
+### An toàn (đã thiết kế)
+- Manual mode: KHÔNG chạy. Cột phẳng: gap≈0 → skip → generate phẳng không đụng.
+
+### CẦN VALIDATE + TUNE (chưa chắc)
+- **Ngưỡng gap `spacing*0.5`**: phân tích tay cho thấy vài cột dốc có gap ~188mm < 250 → có thể BỊ SKIP (miss). Có căng thẳng "bắt được dốc" vs "đừng đụng phẳng" → phải tune bằng before/after thật.
+- **Cần test**: chạy AUTO trên panel dốc FRESH (chưa special-area tay) → export → chạy `collisioncheck` + so với manual → chỉnh ngưỡng.
+- Manual special-area cũng conform-to-boundary + retreat (giống hệt cơ chế này) → về lý thuyết auto sẽ tái tạo được, chỉ là vấn đề ngưỡng kích hoạt.
+
+---
+
 ## Session 2026-08-13 21:20 — ✅ VALIDATION: né va chạm 100% sạch trên V1.dwg
 
 ### Bối cảnh

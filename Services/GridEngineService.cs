@@ -198,6 +198,142 @@ namespace MCG_CreateLashingHole.Services
         }
 
         // ─────────────────────────────────────────────────────────────
+        // AUTO slope/concave conform — XÓA đuôi lỗ ở cạnh XIÊN/LÕM + RẢI LẠI đường
+        // conform sạch bám boundary (né va chạm). Cột phẳng: gate loại → KHÔNG đụng.
+        // ─────────────────────────────────────────────────────────────
+
+        /// <summary>1 chuỗi lỗ conform MỚI trên 1 cột (mọc từ SeedY tới boundary); Deviated song song Ys.</summary>
+        public struct ConformFill
+        {
+            public double X;
+            public double SeedY;          // lỗ interior sạch mà chuỗi mọc ra (để dim + neo)
+            public List<double> Ys;       // Y lỗ MỚI, thứ tự từ seed ra biên
+            public List<bool>   Deviated; // true = lỗ LỆCH hàng chuẩn (cần dim cục bộ — điểm #5)
+        }
+
+        /// <summary>
+        /// AUTO-mode: mỗi cột có cạnh xiên/lõm → XÓA các lỗ đuôi (gần cạnh) + RẢI LẠI đường conform
+        /// sạch tới boundary (giao đầu tiên − offset, né va chạm). Cột phẳng bị gate loại → nguyên vẹn.
+        /// Trả về danh sách chuỗi lỗ MỚI; out keptGrid = lưới phẳng đã bỏ đuôi bị thay; out standardRowKeys
+        /// = tập Y hàng chuẩn (để nhận diện lỗ lệch).
+        /// </summary>
+        public List<ConformFill> ConformColumns(
+            List<Point3d> gridPoints, LashingInputParams p, Polyline boundary,
+            IList<Entity> structures, IList<Line3d> keepOut,
+            out List<Point3d> keptGrid, out HashSet<string> standardRowKeys)
+        {
+            var fills = new List<ConformFill>();
+            standardRowKeys = new HashSet<string>();
+            keptGrid = gridPoints != null ? new List<Point3d>(gridPoints) : new List<Point3d>();
+            if (gridPoints == null || gridPoints.Count == 0) return fills;
+
+            _structures = structures ?? new List<Entity>();
+            _keepOut    = keepOut ?? new List<Line3d>();
+            _clearance  = p.ClearanceRadius;
+            _boundary   = boundary;
+
+            double spacingY = p.SpacingY, offsetY = p.OffsetY;
+            var (bmin, bmax) = AutoCADGeometryHelper.GetSmartRectFromPolyline(boundary);
+
+            // Tập Y hàng chuẩn của lưới phẳng gốc — để nhận diện lỗ LỆCH hàng
+            foreach (var pt in gridPoints) standardRowKeys.Add(CoordKey(pt.Y));
+
+            var byCol = new Dictionary<string, List<Point3d>>();
+            foreach (var pt in gridPoints)
+            {
+                string k = CoordKey(pt.X);
+                if (!byCol.TryGetValue(k, out var l)) { l = new List<Point3d>(); byCol[k] = l; }
+                l.Add(pt);
+            }
+
+            var removed = new HashSet<string>();
+            foreach (var col in byCol.Values)
+            {
+                if (col.Count < 2) continue;
+                double x = col[0].X;
+                var sorted = col.OrderBy(pt => pt.Y).ToList();
+
+                AddConformRun(fills, removed, standardRowKeys, sorted, p, boundary, x, -1,
+                    spacingY, offsetY, bmin.Y, bmax.Y);   // đáy
+                AddConformRun(fills, removed, standardRowKeys, sorted, p, boundary, x, +1,
+                    spacingY, offsetY, bmin.Y, bmax.Y);   // đỉnh
+            }
+
+            if (removed.Count > 0)
+                keptGrid = gridPoints.Where(pt =>
+                    !removed.Contains(CoordKey(pt.X) + "|" + CoordKey(pt.Y))).ToList();
+
+            return fills;
+        }
+
+        /// <summary>1 hướng conform (genDir −1 đáy / +1 đỉnh): gate theo GAP → xóa đuôi + rải lại tới anchor.</summary>
+        private void AddConformRun(
+            List<ConformFill> fills, HashSet<string> removed, HashSet<string> standardRowKeys,
+            List<Point3d> colSorted, LashingInputParams p, Polyline boundary,
+            double x, int genDir, double spacingY, double offsetY,
+            double bMinY, double bMaxY)
+        {
+            double startY = genDir == -1 ? colSorted[0].Y : colSorted[colSorted.Count - 1].Y;
+            if (!AutoCADGeometryHelper.TryRayBoundaryIntersection(
+                    new Point3d(x, startY, 0), new Vector3d(0, genDir, 0), boundary, out Point3d hit))
+                return;
+
+            double edgeY  = hit.Y;
+            double anchor = edgeY - genDir * offsetY;    // lùi offset VÀO TRONG panel
+
+            // GATE: conform khi (a) còn GAP tới biên, HOẶC (b) lỗ ngoài cùng đang VA CHẠM structure
+            // (vòng ngoài ĐỎ) → tái tạo cột sạch thay vì để local-adjust dịch lộn xộn.
+            // Cột phẳng & lỗ đáy không va chạm & sát anchor → BỎ QUA (giữ generate phẳng nguyên vẹn).
+            double outerY        = genDir == -1 ? colSorted[0].Y : colSorted[colSorted.Count - 1].Y;
+            double gap           = genDir == -1 ? (outerY - anchor) : (anchor - outerY);
+            bool   outerCollides = Collides(outerY, x, axisIsX: false);
+            // gap ÂM = lỗ ngoài cùng nằm gần biên hơn offset → nếu gần hơn clearance thì outer ring
+            // cắt biên (Type B) → cũng phải conform (kéo lỗ về anchor).
+            double gapNegLimit   = _clearance - offsetY;   // vd 75 − 150 = −75
+            // Ngưỡng DƯƠNG: dùng MIN_EDGE_DISTANCE_FOR_GAP (khoảng mép tối thiểu, 200) thay vì spacing*0.5.
+            // → bắt cả gap "một phần" ở góc/notch (vd 284mm) mà nửa spacing (300) bỏ sót. Cột phẳng gap≈0 → vẫn bỏ.
+            if (gap <= MIN_EDGE_DISTANCE_FOR_GAP && gap >= gapNegLimit && !outerCollides) return;
+
+            // Seed = lỗ interior SẠCH (cách anchor ≥ ~1 spacing về phía trong)
+            Point3d? seed = null;
+            if (genDir == -1)
+            {
+                foreach (var pt in colSorted)
+                    if (pt.Y >= anchor + spacingY * 0.75) { seed = pt; break; }
+            }
+            else
+            {
+                for (int i = colSorted.Count - 1; i >= 0; i--)
+                    if (colSorted[i].Y <= anchor - spacingY * 0.75) { seed = colSorted[i]; break; }
+            }
+            if (seed == null) return;                    // cột quá ngắn → bỏ, không đụng
+            double seedY = seed.Value.Y;
+
+            // XÓA các lỗ phẳng ở đuôi (phía cạnh, vượt seed) — sẽ được rải lại sạch
+            foreach (var pt in colSorted)
+            {
+                if ((genDir == -1 && pt.Y < seedY - EPS) || (genDir == +1 && pt.Y > seedY + EPS))
+                    removed.Add(CoordKey(pt.X) + "|" + CoordKey(pt.Y));
+            }
+
+            // RẢI LẠI từ seed tới anchor (né va chạm)
+            var line = RegenerateSeedLineSpecial(p, boundary, _structures, _keepOut,
+                new Point3d(x, seedY, 0), new Point3d(x, anchor, 0),
+                spacingY, genDir, axisIsX: false, bMinY, bMaxY);
+
+            var ys  = new List<double>();
+            var dev = new List<bool>();
+            foreach (var pt in line)
+            {
+                if (Math.Abs(pt.Y - seedY) < EPS) continue;   // bỏ seed (đã có)
+                ys.Add(pt.Y);
+                dev.Add(!standardRowKeys.Contains(CoordKey(pt.Y)));   // lệch hàng chuẩn?
+            }
+            if (ys.Count > 0)
+                fills.Add(new ConformFill { X = x, SeedY = seedY, Ys = ys, Deviated = dev });
+        }
+
+        // ─────────────────────────────────────────────────────────────
         // Core — port GenerateCentralPoints
         // ─────────────────────────────────────────────────────────────
         private List<Point3d> GenerateCentralPoints(
@@ -628,7 +764,12 @@ namespace MCG_CreateLashingHole.Services
         {
             Point3d pt = axisIsX ? new Point3d(vary, fixedCoordVal, 0)
                                  : new Point3d(fixedCoordVal, vary, 0);
-            return _collision.HasAnyCollision(pt, _clearance, _structures, _keepOut);
+            // Va chạm = outer ring (bán kính _clearance) đè STRUCTURE...
+            if (_collision.HasAnyCollision(pt, _clearance, _structures, _keepOut)) return true;
+            // ...HOẶC cắt BIÊN (tâm gần biên hơn bán kính outer). 150/75 đều là biến — chỉ va chạm là rõ ràng.
+            if (_boundary != null &&
+                AutoCADGeometryHelper.DistanceToBoundary(pt, _boundary) < _clearance) return true;
+            return false;
         }
 
         private static string CoordKey(double c)

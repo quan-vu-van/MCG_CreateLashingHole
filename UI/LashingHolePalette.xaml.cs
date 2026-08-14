@@ -168,6 +168,9 @@ namespace MCG_CreateLashingHole.UI
         private void CmdStart_Click(object sender, RoutedEventArgs e)
             => Dispatch("MCG_LH_RUN", "Running create flow — follow the command line...");
 
+        private void CmdBatch_Click(object sender, RoutedEventArgs e)
+            => Dispatch("MCG_LH_BATCH", "Batch multi-panel — select boundaries + P/C/S on the command line...");
+
         private void CmdAudit_Click(object sender, RoutedEventArgs e)
             => Dispatch("MCG_LH_AUDIT", "Running spacing audit — follow the command line...");
 
