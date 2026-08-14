@@ -1,12 +1,75 @@
 using System;
+using System.Collections.Generic;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
+using AcRuntime = Autodesk.AutoCAD.Runtime;
 
 namespace MCG_CreateLashingHole.Utilities
 {
     public static class AutoCADGeometryHelper
     {
+        /// <summary>
+        /// Thu thập tâm (world) các circle khớp layer + bán kính, QUÉT CẢ bên trong block reference
+        /// (KHÔNG cần phá block). Circle nằm trong block: tâm được transform qua BlockTransform.
+        /// Chỉ nhận điểm nằm trong boundary nếu boundary != null.
+        /// </summary>
+        public static List<Point3d> CollectCircleCentersWorld(
+            Transaction tr, BlockTableRecord space, Polyline boundary,
+            string layer, double radius, double rTol)
+        {
+            var result      = new List<Point3d>();
+            var circleClass = AcRuntime.RXObject.GetClass(typeof(Circle));
+            var brefClass   = AcRuntime.RXObject.GetClass(typeof(BlockReference));
+
+            foreach (ObjectId id in space)
+            {
+                if (!id.IsValid || id.IsErased) continue;
+
+                // Circle ở model space (chưa đóng block)
+                if (id.ObjectClass.IsDerivedFrom(circleClass))
+                {
+                    Circle c;
+                    try { c = tr.GetObject(id, OpenMode.ForRead) as Circle; }
+                    catch { continue; }
+                    if (c == null || c.IsErased) continue;
+                    if (c.Layer == layer && Math.Abs(c.Radius - radius) < rTol &&
+                        (boundary == null || IsInsidePolylineOrEdge(c.Center, boundary)))
+                        result.Add(c.Center);
+                }
+                // Circle nằm TRONG block reference → transform tâm về world
+                else if (id.ObjectClass.IsDerivedFrom(brefClass))
+                {
+                    BlockReference br;
+                    try { br = tr.GetObject(id, OpenMode.ForRead) as BlockReference; }
+                    catch { continue; }
+                    if (br == null || br.IsErased) continue;
+
+                    Matrix3d xform = br.BlockTransform;
+                    BlockTableRecord btr;
+                    try { btr = tr.GetObject(br.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord; }
+                    catch { continue; }
+                    if (btr == null) continue;
+
+                    foreach (ObjectId eid in btr)
+                    {
+                        if (!eid.IsValid || eid.IsErased || !eid.ObjectClass.IsDerivedFrom(circleClass)) continue;
+                        Circle c;
+                        try { c = tr.GetObject(eid, OpenMode.ForRead) as Circle; }
+                        catch { continue; }
+                        if (c == null || c.IsErased) continue;
+                        if (c.Layer == layer && Math.Abs(c.Radius - radius) < rTol)
+                        {
+                            Point3d wc = c.Center.TransformBy(xform);
+                            if (boundary == null || IsInsidePolylineOrEdge(wc, boundary))
+                                result.Add(wc);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
         /// <summary>
         /// Kiểm tra điểm có nằm bên trong Polyline không (ray-casting).
         /// Hỗ trợ cả Closed và Open polyline (VBA: ALLOW OPEN POLYLINE).
@@ -38,6 +101,34 @@ namespace MCG_CreateLashingHole.Utilities
             }
 
             return inside;
+        }
+
+        /// <summary>
+        /// Bắn tia từ basePt theo hướng dir, tìm giao GẦN NHẤT (khác basePt) với boundary polyline.
+        /// Port FindIntersectionWithLongLine_Helper của VBA — dùng Line ảo trong RAM (KHÔNG thêm vào DB).
+        /// Trả false nếu không có giao điểm hợp lệ.
+        /// </summary>
+        public static bool TryRayBoundaryIntersection(Point3d basePt, Vector3d dir, Polyline boundary, out Point3d hit)
+        {
+            hit = basePt;
+            var far = new Point3d(basePt.X + dir.X * 1_000_000.0,
+                                  basePt.Y + dir.Y * 1_000_000.0, 0);
+            using (var ray = new Line(basePt, far))
+            {
+                var pts = new Point3dCollection();
+                try { ray.IntersectWith(boundary, Intersect.OnBothOperands, pts, IntPtr.Zero, IntPtr.Zero); }
+                catch { return false; }
+
+                double bestSq = -1.0;
+                foreach (Point3d pt in pts)
+                {
+                    double dsq = (pt.X - basePt.X) * (pt.X - basePt.X) +
+                                 (pt.Y - basePt.Y) * (pt.Y - basePt.Y);
+                    if (dsq < 1e-6) continue; // bỏ giao trùng basePt
+                    if (bestSq < 0 || dsq < bestSq) { bestSq = dsq; hit = new Point3d(pt.X, pt.Y, 0); }
+                }
+                return bestSq >= 0;
+            }
         }
 
         /// <summary>
@@ -107,6 +198,54 @@ namespace MCG_CreateLashingHole.Utilities
         {
             try { ZoomToBoundary(ed, boundary.GeometricExtents, marginMm); }
             catch { }
+        }
+
+        /// <summary>
+        /// Xác định mép hình chữ nhật tham chiếu theo nguyên tắc CẠNH DÀI của VBA
+        /// (GetSmartRectangularPointsFromPolyline): chỉ các cạnh thẳng > 1500mm mới định nghĩa mép:
+        ///   cạnh đứng  (Δx &lt; 1mm) → minX/maxX (mép trái/phải)
+        ///   cạnh ngang (Δy &lt; 1mm) → minY/maxY (mép trên/dưới)
+        /// Bỏ qua cạnh cong (bulge) và cạnh ngắn (vết khía/bậc nhỏ).
+        /// Fallback per-axis về bounding box (fbMin/fbMax) nếu trục không có cạnh dài nào.
+        /// Trung thành VBA: luôn khép vòng (i+1) mod n khi duyệt cạnh.
+        /// </summary>
+        public static void GetSmartRectEdges(
+            Polyline poly, Point3d fbMin, Point3d fbMax,
+            out double minX, out double maxX, out double minY, out double maxY)
+        {
+            const double LENGTH_THRESHOLD = 1500.0;
+            minX = double.MaxValue; maxX = double.MinValue;
+            minY = double.MaxValue; maxY = double.MinValue;
+            bool foundX = false, foundY = false;
+
+            int n = poly.NumberOfVertices;
+            for (int i = 0; i < n; i++)
+            {
+                if (Math.Abs(poly.GetBulgeAt(i)) >= 0.001) continue; // bỏ cạnh cong
+
+                int     next = (i + 1) % n;                          // khép vòng như VBA
+                Point2d v1   = poly.GetPoint2dAt(i);
+                Point2d v2   = poly.GetPoint2dAt(next);
+                double  dX   = Math.Abs(v2.X - v1.X);
+                double  dY   = Math.Abs(v2.Y - v1.Y);
+                if (Math.Sqrt(dX * dX + dY * dY) <= LENGTH_THRESHOLD) continue; // bỏ cạnh ngắn
+
+                if (dX < 1.0)   // cạnh đứng → mép trái/phải
+                {
+                    if (v1.X < minX) minX = v1.X;
+                    if (v1.X > maxX) maxX = v1.X;
+                    foundX = true;
+                }
+                if (dY < 1.0)   // cạnh ngang → mép trên/dưới
+                {
+                    if (v1.Y < minY) minY = v1.Y;
+                    if (v1.Y > maxY) maxY = v1.Y;
+                    foundY = true;
+                }
+            }
+
+            if (!foundX) { minX = fbMin.X; maxX = fbMax.X; }
+            if (!foundY) { minY = fbMin.Y; maxY = fbMax.Y; }
         }
 
         /// <summary>Lấy bounding box an toàn từ Polyline.</summary>

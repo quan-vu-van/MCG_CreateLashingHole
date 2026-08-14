@@ -12,6 +12,60 @@ using MCG_CreateLashingHole.Utilities;
 namespace MCG_CreateLashingHole.Services
 {
     /// <summary>
+    /// Trạng thái tạm giữ giữa lệnh generate (MCG_LH_RUN) và hậu xử lý (MCG_LH_POST).
+    /// Flow bị tách 2 lệnh để lỗ hiện ra màn hình TRƯỚC khi hỏi special area:
+    /// lệnh generate kết thúc → AutoCAD repaint toàn bộ → lỗ chắc chắn hiển thị →
+    /// MCG_LH_POST (tự chạy qua Application.Idle) mới hỏi các bước hiệu chỉnh.
+    /// </summary>
+    public static class LashingWorkflowState
+    {
+        /// <summary>Có phiên generate vừa xong đang chờ hậu xử lý không</summary>
+        public static bool HasPending { get; set; }
+        /// <summary>Boundary polyline đã chọn</summary>
+        public static ObjectId BoundaryId { get; set; }
+        /// <summary>Danh sách cấu kiện đã quét trong boundary</summary>
+        public static List<ObjectId> StructureIds { get; set; } = new List<ObjectId>();
+        /// <summary>Keep-out zones ảo của panel liền kề (RAM)</summary>
+        public static List<Line3d> KeepOut { get; set; } = new List<Line3d>();
+
+        /// <summary>Góc tham chiếu P1 (dùng cho hướng phát triển special area)</summary>
+        public static Point3d P1 { get; set; }
+        /// <summary>Góc tham chiếu P2</summary>
+        public static Point3d P2 { get; set; }
+
+        /// <summary>
+        /// Cờ báo POST cần chạy lại để hỏi tiếp special area. Sau MỖI lần điều chỉnh, lệnh POST
+        /// kết thúc (để AutoCAD repaint lỗ mới) rồi tự chạy lại qua Idle — user luôn thấy kết quả
+        /// trước khi quyết định lần kế. Tắt cờ khi user chọn "No" (chuyển sang local adjust + block).
+        /// </summary>
+        public static bool ContinueSpecial { get; set; }
+
+        /// <summary>Lưu state cuối bước generate, đánh dấu chờ hậu xử lý</summary>
+        public static void Set(ObjectId boundary, List<ObjectId> structures, List<Line3d> keepOut,
+            Point3d p1, Point3d p2)
+        {
+            BoundaryId   = boundary;
+            StructureIds = structures ?? new List<ObjectId>();
+            KeepOut      = keepOut ?? new List<Line3d>();
+            P1           = p1;
+            P2           = p2;
+            HasPending   = true;
+        }
+
+        /// <summary>Xóa state sau khi hậu xử lý xong (hoặc khi bắt đầu phiên mới)</summary>
+        public static void Clear()
+        {
+            HasPending   = false;
+            BoundaryId   = ObjectId.Null;
+            StructureIds    = new List<ObjectId>();
+            KeepOut         = new List<Line3d>();
+            P1              = Point3d.Origin;
+            P2              = Point3d.Origin;
+            ContinueSpecial = false;
+        }
+    }
+
+    /// <summary>
     /// Flow tuần tự dẫn dắt qua command line — port trung thành VBA CFS_CreateLashingHole:
     /// palette chỉ nhập tham số + bấm START; mọi tương tác tiếp theo (chọn boundary,
     /// structures, adjacent V/H/N, P1/P2, special area Y/N loop, local adjust, tên block)
@@ -42,8 +96,12 @@ namespace MCG_CreateLashingHole.Services
         // FLOW CHÍNH — MCG_LH_RUN
         // ═════════════════════════════════════════════════════════════
 
-        /// <summary>Chạy trọn flow tạo lỗ lashing như VBA: boundary → structures → adjacent → P1/P2 → Phase 1 → special area loop → local adjust → block packing</summary>
-        public void RunCreateFlow()
+        /// <summary>
+        /// PHẦN 1 (MCG_LH_RUN): boundary → structures → adjacent → P1/P2 → sinh lưới + vẽ lỗ + dimension.
+        /// KẾT THÚC tại đây để AutoCAD repaint (lỗ hiển thị chắc chắn); special area / local adjust /
+        /// đóng block chuyển sang MCG_LH_POST (auto-chain qua Application.Idle).
+        /// </summary>
+        public void RunGenerate()
         {
             var doc = AcApp.DocumentManager.MdiActiveDocument;
             if (doc == null) return;
@@ -51,7 +109,9 @@ namespace MCG_CreateLashingHole.Services
             var db = doc.Database;
             var p  = LashingParamsStore.Current ?? new LashingInputParams();
 
-            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === START CREATE FLOW ===");
+            LashingWorkflowState.Clear(); // reset state phiên trước
+
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === START GENERATE ===");
             ed.WriteMessage("\n=== MCG LASHING HOLE — CREATE FLOW ===");
 
             // ── Step 2: Chọn boundary (luôn pick trên màn hình như VBA) ──
@@ -93,8 +153,8 @@ namespace MCG_CreateLashingHole.Services
             Point3d p1, p2;
             if (p.IsAutomaticMode)
             {
-                (p1, p2) = DeriveP1P2(box, p.LocationMode);
-                ed.WriteMessage($"\nSmart boundary ({p.LocationMode}): " +
+                (p1, p2) = GetSmartP1P2(db, boundaryId, box, p.LocationMode);
+                ed.WriteMessage($"\nSmart boundary ({p.LocationMode}, long-edge 1500mm): " +
                     $"P1({p1.X:F0},{p1.Y:F0}) - P2({p2.X:F0},{p2.Y:F0})");
             }
             else
@@ -144,9 +204,9 @@ namespace MCG_CreateLashingHole.Services
                             var b       = (Polyline)tr.GetObject(boundaryId, OpenMode.ForRead);
                             var structs = OpenStructures(tr, structureIds);
                             if (!AutoCADGeometryHelper.IsInsidePolylineOrEdge(cand, b))
-                                ed.WriteMessage("\nĐiểm nằm ngoài boundary. Chọn lại.");
+                                ed.WriteMessage("\nPoint is outside the boundary. Pick again.");
                             else if (_collision.HasAnyCollision(cand, p.ClearanceRadius, structs, keepOut))
-                                ed.WriteMessage("\nĐiểm va chạm với cấu kiện. Chọn lại.");
+                                ed.WriteMessage("\nPoint collides with a structure. Pick again.");
                             else ok = true;
                             tr.Commit();
                         }
@@ -158,6 +218,8 @@ namespace MCG_CreateLashingHole.Services
             // ── PHASE 1: Sinh lưới + vẽ + dimension ──
             ed.WriteMessage("\nPHASE 1: Generating initial point grid...");
             List<ObjectId> innerIds;
+            BlockPackingService.DrawStats stats;
+            int gridCount;
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 try
@@ -174,9 +236,10 @@ namespace MCG_CreateLashingHole.Services
 
                     var grid = _gridEngine.GenerateGrid(p, boundary, structs, keepOut,
                         p1, p2, startOption, effCenter, skipCenterAdjust);
+                    gridCount = grid.Count;
 
                     innerIds = _packing.DrawHolesWithDimensions(p, boundary, structs, keepOut,
-                        grid, p1, rectMinX, rectMaxX, rectMinY, rectMaxY, tr, space, db);
+                        grid, p1, rectMinX, rectMaxX, rectMinY, rectMaxY, tr, space, db, out stats);
                     tr.Commit();
                 }
                 catch
@@ -190,48 +253,131 @@ namespace MCG_CreateLashingHole.Services
                 ed.WriteMessage("\nPHASE 1: Unable to generate points.");
                 return;
             }
-            ed.WriteMessage($"\nPHASE 1 done: {innerIds.Count} hole(s) created.");
+            // Chẩn đoán tránh va chạm — báo số liệu để kiểm chứng logic đang chạy
+            ed.WriteMessage(
+                $"\nPHASE 1 done: {innerIds.Count} hole(s). " +
+                $"[structures={structureIds.Count}, grid={gridCount}, " +
+                $"colliding(red)={stats.Red} -> resolve via local adjust]");
+            if (structureIds.Count == 0)
+                ed.WriteMessage("\n! No structures selected -> nothing to avoid.");
 
-            // ── PHASE 2: Special area adjustment loop (Y/N như VBA) ──
-            while (true)
+            // Lỗ đã commit vào database. KẾT THÚC lệnh generate tại đây: khi lệnh trả về
+            // "Command:" AutoCAD repaint toàn bộ nên lỗ + dimension CHẮC CHẮN hiển thị.
+            // (Regen/UpdateScreen GIỮA một lệnh modal không flush được graphics — đó là lý do
+            //  trước đây lỗ hiện muộn.) Special area / local adjust / đóng block chuyển sang
+            // lệnh MCG_LH_POST, tự động chạy sau khi màn hình đã vẽ xong lỗ.
+            LashingWorkflowState.Set(boundaryId, structureIds, keepOut, p1, p2);
+            ed.WriteMessage("\n-> Holes displayed. Continuing to special-area / adjustment...");
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === GENERATE DONE, chờ POST ===");
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // PHẦN 2 — MCG_LH_POST (lệnh riêng: lỗ đã hiển thị trước khi hỏi)
+        // ═════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// PHẦN 2 (MCG_LH_POST): special area loop → local adjust → đóng block.
+        /// Chạy ở lệnh riêng để lỗ đã được AutoCAD vẽ ra màn hình TRƯỚC khi hỏi user —
+        /// giải quyết triệt để "lỗ hiện muộn". Đọc state từ LashingWorkflowState.
+        /// </summary>
+        public void RunPostProcess()
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+            var ed = doc.Editor;
+            var db = doc.Database;
+            var p  = LashingParamsStore.Current ?? new LashingInputParams();
+
+            if (!LashingWorkflowState.HasPending)
             {
-                string ans = Keyword(ed, "\nPerform special area adjustment?", "No", "Yes", "No");
-                if (ans != "Yes") break;
+                ed.WriteMessage("\nNo pending lashing session. Please click START first.");
+                return;
+            }
+            ObjectId       boundaryId   = LashingWorkflowState.BoundaryId;
+            List<ObjectId> structureIds = LashingWorkflowState.StructureIds ?? new List<ObjectId>();
+            List<Line3d>   keepOut      = LashingWorkflowState.KeepOut ?? new List<Line3d>();
+            if (boundaryId.IsNull || boundaryId.IsErased)
+            {
+                LashingWorkflowState.Clear();
+                ed.WriteMessage("\nBoundary is no longer valid. Post-processing cancelled.");
+                return;
+            }
 
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === START POST PROCESS ===");
+
+            // ── PHASE 2: MỘT bước special area mỗi lần chạy POST ──
+            // Sau mỗi lần điều chỉnh, KẾT THÚC lệnh (AutoCAD repaint → user thấy lỗ mới) rồi
+            // tự chạy lại POST qua Idle để hỏi tiếp — luôn thấy kết quả trước khi quyết định.
+            // Chọn "No" → tắt cờ, chuyển sang local adjust + đóng block.
+            string ans = Keyword(ed, "\nPerform special area adjustment?", "No", "Yes", "No");
+            if (ans == "Yes")
+            {
                 ObjectId h1 = PromptCircle(ed, "\nSelect START hole (outer circle):");
-                if (h1.IsNull) continue;
-                ObjectId h2 = PromptCircle(ed, "\nSelect END hole (outer circle):");
-                if (h2.IsNull || h2 == h1) continue;
+                ObjectId h2 = h1.IsNull ? ObjectId.Null
+                                        : PromptCircle(ed, "\nSelect END hole (outer circle):");
 
-                using (var tr = db.TransactionManager.StartTransaction())
+                if (!h1.IsNull && !h2.IsNull && h2 != h1)
                 {
-                    try
+                    // Đọc tâm 2 lỗ để xác định trục dải + base cho pick hướng
+                    Point3d startC, endC;
+                    using (var rtr = db.TransactionManager.StartTransaction())
                     {
-                        var c1       = (Circle)tr.GetObject(h1, OpenMode.ForRead);
-                        var c2       = (Circle)tr.GetObject(h2, OpenMode.ForRead);
-                        var boundary = (Polyline)tr.GetObject(boundaryId, OpenMode.ForRead);
-                        var structs  = OpenStructures(tr, structureIds);
-                        var bt       = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
-                        var space    = (BlockTableRecord)tr.GetObject(
-                                           bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
-
-                        bool   isVertical = Math.Abs(c1.Center.Y - c2.Center.Y) >
-                                            Math.Abs(c1.Center.X - c2.Center.X);
-                        double spacing    = isVertical ? p.SpacingY : p.SpacingX;
-                        double offset     = isVertical ? p.OffsetY  : p.OffsetX;
-
-                        var created = _fillGap.RegenerateSpecialArea(
-                            c1, c2, boundary, spacing, offset, isVertical, p, tr, space, structs);
-                        tr.Commit();
-                        ed.WriteMessage($"\n-> {created.Count} intermediate hole(s) added.");
+                        startC = ((Circle)rtr.GetObject(h1, OpenMode.ForRead)).Center;
+                        endC   = ((Circle)rtr.GetObject(h2, OpenMode.ForRead)).Center;
+                        rtr.Commit();
                     }
-                    catch (Exception ex)
+                    // Dải cùng Y → mọc CỘT DỌC (trục Y); cùng X → mọc HÀNG NGANG (trục X)
+                    bool isVerticalRegen = Math.Abs(startC.Y - endC.Y) < 1e-3;
+
+                    // HƯỚNG điều chỉnh theo CHUỘT — rubber-band từ lỗ START, user click về phía muốn mọc
+                    var ppo = new PromptPointOptions(
+                        "\nClick a point to indicate growth direction:")
+                    { UseBasePoint = true, BasePoint = startC, AllowNone = false };
+                    var pr = ed.GetPoint(ppo);
+
+                    if (pr.Status == PromptStatus.OK)
                     {
-                        tr.Abort();
-                        ed.WriteMessage($"\nLỗi: {ex.Message}");
+                        int genDir = isVerticalRegen
+                            ? Math.Sign(pr.Value.Y - startC.Y)
+                            : Math.Sign(pr.Value.X - startC.X);
+                        if (genDir == 0) genDir = 1;
+
+                        int createdCount = 0;
+                        using (var tr = db.TransactionManager.StartTransaction())
+                        {
+                            try
+                            {
+                                var c1       = (Circle)tr.GetObject(h1, OpenMode.ForRead);
+                                var c2       = (Circle)tr.GetObject(h2, OpenMode.ForRead);
+                                var boundary = (Polyline)tr.GetObject(boundaryId, OpenMode.ForRead);
+                                var structs  = OpenStructures(tr, structureIds);
+                                var bt       = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                                var space    = (BlockTableRecord)tr.GetObject(
+                                                   bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                                var created = _fillGap.RegenerateSpecialArea(
+                                    c1, c2, genDir, boundary, p, tr, space, _gridEngine, structs, keepOut);
+                                createdCount = created.Count;
+                                tr.Commit();
+                            }
+                            catch (Exception ex)
+                            {
+                                tr.Abort();
+                                ed.WriteMessage($"\nError: {ex.Message}");
+                            }
+                        }
+                        ed.WriteMessage($"\n-> Special area regenerated: {createdCount} new hole(s).");
                     }
                 }
+
+                // Giữ phiên, KẾT THÚC lệnh → repaint lỗ mới → tự hỏi lại (Idle re-chain POST)
+                LashingWorkflowState.ContinueSpecial = true;
+                System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} Special step done, re-chain POST.");
+                return;
             }
+
+            // ans == "No" → dừng vòng special, tiếp tục local adjust + đóng block
+            LashingWorkflowState.ContinueSpecial = false;
 
             // ── PHASE 3: Local adjustment (Auto → tự chạy như VBA) ──
             string doAdj = p.IsAutomaticMode
@@ -259,6 +405,7 @@ namespace MCG_CreateLashingHole.Services
                     }
                 }
                 ed.WriteMessage($"\nLocal adjustment: {moved} hole(s) relocated.");
+                ed.Regen(); ed.UpdateScreen();
             }
 
             // ── BLOCK PACKING: hỏi tên qua command line (Esc = bỏ qua) ──
@@ -285,7 +432,7 @@ namespace MCG_CreateLashingHole.Services
                 }
                 if (exists)
                 {
-                    ed.WriteMessage($"\nBlock '{name}' đã tồn tại. Chọn tên khác.");
+                    ed.WriteMessage($"\nBlock '{name}' already exists. Choose another name.");
                     baseName = name + "_2";
                     continue;
                 }
@@ -304,7 +451,7 @@ namespace MCG_CreateLashingHole.Services
                     catch (Exception ex)
                     {
                         tr.Abort();
-                        ed.WriteMessage($"\nLỗi đóng block: {ex.Message}");
+                        ed.WriteMessage($"\nBlock packing error: {ex.Message}");
                     }
                 }
                 break;
@@ -313,7 +460,8 @@ namespace MCG_CreateLashingHole.Services
             ed.WriteMessage(packed != null
                 ? $"\nBlock '{packed}' created successfully. Done."
                 : "\nDone.");
-            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === END CREATE FLOW ===");
+            LashingWorkflowState.Clear();
+            System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} === END POST PROCESS ===");
         }
 
         // ═════════════════════════════════════════════════════════════
@@ -340,21 +488,10 @@ namespace MCG_CreateLashingHole.Services
                 var ms       = (BlockTableRecord)tr.GetObject(
                                    bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
 
-                var circleClass = AcRuntime.RXObject.GetClass(typeof(Circle));
-                var holes = new List<Circle>();
-                foreach (ObjectId id in ms)
-                {
-                    if (!id.IsValid || id.IsErased || !id.ObjectClass.IsDerivedFrom(circleClass)) continue;
-                    try
-                    {
-                        if (tr.GetObject(id, OpenMode.ForRead) is Circle c
-                            && c.Layer == LashingInputParams.LAYER_INNER_HOLE
-                            && AutoCADGeometryHelper.IsInsidePolylineOrEdge(c.Center, boundary))
-                            holes.Add(c);
-                    }
-                    catch { }
-                }
-                report = BuildAuditReport(holes, p);
+                // Quét inner hole CẢ trong block (không cần phá block)
+                var centers = AutoCADGeometryHelper.CollectCircleCentersWorld(
+                    tr, ms, boundary, LashingInputParams.LAYER_INNER_HOLE, p.HoleDiameter / 2.0, 0.5);
+                report = BuildAuditReport(centers, p);
                 tr.Commit();
             }
             ed.WriteMessage($"\n[AUDIT]\n{report}");
@@ -518,11 +655,18 @@ namespace MCG_CreateLashingHole.Services
                 }
                 tr.Commit();
             }
-            ed.WriteMessage("\nĐối tượng đã chọn quá nhỏ (< 20m²) hoặc sai layer!");
+            ed.WriteMessage("\nSelected object is too small (< 20m2) or on the wrong layer!");
             return ObjectId.Null;
         }
 
-        /// <summary>Tự quét cấu kiện bằng crossing window trên bbox, lọc bỏ INSERT + layer AM_11 (khớp VBA SelectStructuresByExample_Helper — .NET không cần ZoomWindow)</summary>
+        /// <summary>
+        /// Tự quét cấu kiện overlap bbox boundary, lọc bỏ INSERT + layer AM_11 (khớp VBA SelectStructuresByExample_Helper).
+        /// Dùng SelectAll (quét TOÀN BỘ database theo filter) + test overlap bbox thủ công — KẾT QUẢ TẤT ĐỊNH,
+        /// KHÔNG phụ thuộc view. (SelectCrossingWindow bỏ sót đối tượng NGOÀI MÀN HÌNH; VBA phải ZoomWindow
+        /// trước khi crossing để né lỗi này — chính là nguyên nhân "thuật toán thông minh" chạy thất thường
+        /// giữa các panel có input giống hệt: panel nào tình cờ nằm trong view thì né va chạm, panel ngoài
+        /// view thì quét ra 0 cấu kiện → rải lỗ lưới phẳng.)
+        /// </summary>
         private static List<ObjectId> SelectStructuresByCrossing(
             Editor ed, Database db, ObjectId boundaryId, Extents3d box)
         {
@@ -537,14 +681,37 @@ namespace MCG_CreateLashingHole.Services
                 new TypedValue((int)DxfCode.Operator,  "NOT>"),
                 new TypedValue((int)DxfCode.Operator,  "AND>"),
             };
-            var res = ed.SelectCrossingWindow(box.MinPoint, box.MaxPoint, new SelectionFilter(fv));
+
+            // SelectAll: quét toàn bộ model space theo filter — KHÔNG phụ thuộc view (khác SelectCrossingWindow)
+            var res = ed.SelectAll(new SelectionFilter(fv));
             if (res.Status != PromptStatus.OK) return new List<ObjectId>();
 
             var curveClass = AcRuntime.RXObject.GetClass(typeof(Curve));
-            return res.Value.GetObjectIds()
-                .Where(id => id != boundaryId && id.IsValid && !id.IsErased &&
-                             id.ObjectClass.IsDerivedFrom(curveClass))
-                .ToList();
+            var result     = new List<ObjectId>();
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (ObjectId id in res.Value.GetObjectIds())
+                {
+                    if (id == boundaryId || !id.IsValid || id.IsErased ||
+                        !id.ObjectClass.IsDerivedFrom(curveClass)) continue;
+
+                    Entity ent;
+                    try { ent = tr.GetObject(id, OpenMode.ForRead) as Entity; }
+                    catch { continue; }
+                    if (ent == null) continue;
+
+                    Extents3d e;
+                    try { e = ent.GeometricExtents; }
+                    catch { continue; } // entity không có extents hợp lệ → bỏ
+
+                    // Overlap bbox 2D với boundary (crossing = có giao vùng)
+                    if (e.MaxPoint.X >= box.MinPoint.X && e.MinPoint.X <= box.MaxPoint.X &&
+                        e.MaxPoint.Y >= box.MinPoint.Y && e.MinPoint.Y <= box.MaxPoint.Y)
+                        result.Add(id);
+                }
+                tr.Commit();
+            }
+            return result;
         }
 
         /// <summary>Chọn cấu kiện panel liền kề trên màn hình → dựng keep-out zones ảo trong RAM</summary>
@@ -590,7 +757,7 @@ namespace MCG_CreateLashingHole.Services
         private static ObjectId PromptCircle(Editor ed, string message)
         {
             var peo = new PromptEntityOptions(message);
-            peo.SetRejectMessage("\nĐối tượng phải là Circle.");
+            peo.SetRejectMessage("\nObject must be a Circle.");
             peo.AddAllowedClass(typeof(Circle), false);
             var r = ed.GetEntity(peo);
             return r.Status == PromptStatus.OK ? r.ObjectId : ObjectId.Null;
@@ -609,18 +776,29 @@ namespace MCG_CreateLashingHole.Services
             return list;
         }
 
-        /// <summary>Suy P1/P2 từ bbox theo LocationMode (StarBoard: P1 Trên-Trái; còn lại: P1 Dưới-Trái)</summary>
-        private static (Point3d, Point3d) DeriveP1P2(Extents3d box, LashingLocationMode mode)
+        /// <summary>
+        /// Suy P1/P2 theo nguyên tắc CẠNH DÀI 1500mm của VBA (GetSmartRectangularPointsFromPolyline):
+        /// mở boundary, lấy mép từ các cạnh thẳng dài (fallback bbox), gán góc theo LocationMode
+        /// (StarBoard: P1 Trên-Trái; PortSide/Center: P1 Dưới-Trái).
+        /// </summary>
+        private static (Point3d, Point3d) GetSmartP1P2(
+            Database db, ObjectId boundaryId, Extents3d box, LashingLocationMode mode)
         {
-            return mode == LashingLocationMode.StarBoard
-                ? (new Point3d(box.MinPoint.X, box.MaxPoint.Y, 0),
-                   new Point3d(box.MaxPoint.X, box.MinPoint.Y, 0))
-                : (new Point3d(box.MinPoint.X, box.MinPoint.Y, 0),
-                   new Point3d(box.MaxPoint.X, box.MaxPoint.Y, 0));
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var pl = (Polyline)tr.GetObject(boundaryId, OpenMode.ForRead);
+                AutoCADGeometryHelper.GetSmartRectEdges(pl, box.MinPoint, box.MaxPoint,
+                    out double minX, out double maxX, out double minY, out double maxY);
+                tr.Commit();
+
+                return mode == LashingLocationMode.StarBoard
+                    ? (new Point3d(minX, maxY, 0), new Point3d(maxX, minY, 0))
+                    : (new Point3d(minX, minY, 0), new Point3d(maxX, maxY, 0));
+            }
         }
 
-        /// <summary>Báo cáo spacing lệch chuẩn theo nhóm hàng/cột (chuyển từ palette sang)</summary>
-        private static string BuildAuditReport(List<Circle> holes, LashingInputParams p)
+        /// <summary>Báo cáo spacing lệch chuẩn theo nhóm hàng/cột (tâm lỗ world, đã gồm lỗ trong block)</summary>
+        private static string BuildAuditReport(List<Point3d> holes, LashingInputParams p)
         {
             if (holes.Count == 0)
                 return $"AUDIT: No holes on '{LashingInputParams.LAYER_INNER_HOLE}' inside boundary.";
@@ -636,20 +814,20 @@ namespace MCG_CreateLashingHole.Services
             const double GROUP_TOL = 5.0;
             int irregular = 0;
 
-            var rows = holes.GroupBy(c => Math.Round(c.Center.Y / GROUP_TOL) * GROUP_TOL);
+            var rows = holes.GroupBy(c => Math.Round(c.Y / GROUP_TOL) * GROUP_TOL);
             foreach (var row in rows)
             {
-                var sorted = row.OrderBy(c => c.Center.X).ToList();
+                var sorted = row.OrderBy(c => c.X).ToList();
                 for (int i = 1; i < sorted.Count; i++)
-                    if (Math.Abs(Math.Abs(sorted[i].Center.X - sorted[i - 1].Center.X) - p.SpacingX) > GROUP_TOL)
+                    if (Math.Abs(Math.Abs(sorted[i].X - sorted[i - 1].X) - p.SpacingX) > GROUP_TOL)
                         irregular++;
             }
-            var cols = holes.GroupBy(c => Math.Round(c.Center.X / GROUP_TOL) * GROUP_TOL);
+            var cols = holes.GroupBy(c => Math.Round(c.X / GROUP_TOL) * GROUP_TOL);
             foreach (var col in cols)
             {
-                var sorted = col.OrderBy(c => c.Center.Y).ToList();
+                var sorted = col.OrderBy(c => c.Y).ToList();
                 for (int i = 1; i < sorted.Count; i++)
-                    if (Math.Abs(Math.Abs(sorted[i].Center.Y - sorted[i - 1].Center.Y) - p.SpacingY) > GROUP_TOL)
+                    if (Math.Abs(Math.Abs(sorted[i].Y - sorted[i - 1].Y) - p.SpacingY) > GROUP_TOL)
                         irregular++;
             }
 

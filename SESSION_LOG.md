@@ -1,3 +1,294 @@
+## Session 2026-08-13 21:20 — ✅ VALIDATION: né va chạm 100% sạch trên V1.dwg
+
+### Bối cảnh
+- User có công cụ export riêng `MCG_.ExportDwgData` (`ExportDwgDataCommand.cs`, lệnh `MCG_ExportDwgData`) xuất boundary/holes/structures ra JSON+MD. Export đọc lỗ trong block OK.
+- Vá thêm cho export tool: `StructureData.Vertices` + `ExtractStructureVertices` (đỉnh world, tessellate cung) + xuất `"Vertices"` trong JSON → phân tích va chạm chính xác thay vì bbox.
+
+### Kết quả (panel V1.dwg, 2 block PNL_01_1/2)
+- Bộ kiểm tra offline `scratchpad/collisioncheck` (point-to-segment với 81 cấu kiện có vertices):
+  - **946 lỗ, 0 va chạm thật (0.00%)**, 573 borderline (75–100mm = dấu hiệu né đúng).
+  - 22 "va chạm" theo bbox trước đó đều là FALSE POSITIVE (thanh xiên 26B1F bbox 8698×825 → thực ra dải mảnh ~10mm).
+- → Củng cố fix view-dependent (SelectAll): khi cấu kiện được quét đủ, addin đặt lỗ chính xác 100%.
+
+### Công cụ để lại
+- `collisioncheck` (đọc JSON export → đếm va chạm thật) = regression check nhanh cho các panel export sau.
+
+---
+
+## Session 2026-08-13 14:56 — 🐛 FIX: generate không được relocate (thuộc local adjust)
+
+### Triệu chứng (user, manual mode)
+- Local adjust "đã thực hiện ngay ở bước generate" nhưng addin VẪN hỏi "Perform local adjustment?" → vô lý.
+
+### Nguyên nhân
+- `DrawHolesWithDimensions` (generate) đang **relocate 8-hướng bằng FindSafePoint** → làm luôn việc của local adjust.
+- VBA gốc: generate chỉ `CheckAndHighlightConflicts` (dòng 2435) — **CHỈ tô đỏ (`acRed`), KHÔNG dời lỗ**. Dời 8-hướng là của `PerformLocalAdjustments_Phase2` (bước local adjust).
+
+### Đã sửa
+- `DrawHolesWithDimensions`: bỏ FindSafePoint relocate ở generate → chỉ vẽ lỗ tại điểm lưới + tô ĐỎ nếu va chạm (`markRed = collides`). Grid engine vẫn retreat in-line như cũ.
+- Kết quả: generate hiện lỗ + đỏ chỗ va chạm → prompt "Perform local adjustment?" giờ CÓ nghĩa → local adjust (auto ở auto-mode / hỏi ở manual) mới dời lỗ đỏ.
+- Cập nhật message PHASE 1: `colliding(red)=N -> resolve via local adjust`. Bỏ `stats.Relocated` (nay luôn 0 ở generate).
+- Build PASS (`MCG_LashingHole_20260813_145628.dll`).
+
+### Ghi chú
+- `AddAdjustedDimensions`/`AdjustedHole` nay không được gọi ở generate (adjusted rỗng) — để lại, vô hại. Dim lỗ dời do local adjust tự thêm.
+
+---
+
+## Session 2026-08-13 14:04 — 🐛 FIX: cấu kiện quét thất thường (view-dependent)
+
+### Triệu chứng (user báo, có file DXF `File dxf/Test V1.dxf`)
+- 2 panel input GIỐNG HỆT (vd PN_01_11 vs PN_01_12): panel này addin rải lỗ tốt + né va chạm, panel kia "thuật toán thông minh gần như không chạy". User nghi stale data không xóa giữa các phiên.
+
+### Điều tra
+- Đọc được DXF (ASCII AC1032, 18MB, 1.9M dòng). Layers khớp domain addin (boundary AM_0/0, cấu kiện, AM_11 loại trừ, holes 0/AM_9). Block addin: `PNL_01_L.H_1` (1068 circle), `PNL_01_L.H_2` (1028).
+- **Audit static state**: SẠCH — `LashingParamsStore.Current` ghi đè mỗi START; `LashingWorkflowState.Clear()` gọi đầu `RunGenerate`; services tạo mới mỗi lệnh. → KHÔNG phải "saved data".
+- **NGUYÊN NHÂN THẬT**: `SelectStructuresByCrossing` dùng `ed.SelectCrossingWindow` — **phụ thuộc VIEW**, bỏ sót cấu kiện ngoài màn hình. VBA gốc `SelectStructuresByExample_Helper` (dòng 1836) có **"CRITICAL FIX: AUTO ZOOM"** (`ZoomWindow` + buffer 10% trước khi crossing) vì "AutoCAD sometimes misses objects if they are off-screen". C# port ĐÃ BỎ zoom (comment sai ".NET không cần ZoomWindow"). → panel ngoài view quét 0 cấu kiện → né va chạm không có gì để né → lưới phẳng.
+
+### Đã sửa
+- `SelectStructuresByCrossing`: thay `SelectCrossingWindow` → **`ed.SelectAll(filter)` + test overlap bbox thủ công** (tất định, KHÔNG phụ thuộc view, không nhảy màn hình). Fix cho cả RunGenerate lẫn RunInterferenceAudit.
+- Build PASS (`MCG_LashingHole_20260813_140445.dll`).
+
+### Còn lại
+- Runtime-test trên bản vẽ Test V1 (panel từng lỗi giờ phải né va chạm ổn định).
+- (tuỳ) xác nhận sâu trong DXF: PN_01_11 có lỗ đè cấu kiện không.
+
+---
+
+## Session 2026-08-01 22:40 — 📌 ĐIỂM DỪNG (PIN)
+
+> User ghim điểm dừng. "Còn rất nhiều việc với logic RẢI LỖ và ĐIỀU CHỈNH so với VBA" — xử lý tiếp sau.
+
+### Build hiện tại
+- `MCG_LashingHole_20260801_222200.dll` (Debug, 0 warn/err). CHƯA runtime-test các thay đổi mới nhất.
+
+### ĐÃ XONG (chuỗi session hôm nay)
+1. **Lỗ hiện trước prompt** — tách `RunGenerate` (MCG_LH_RUN) / `RunPostProcess` (MCG_LH_POST); lệnh kết thúc → AutoCAD repaint → lỗ hiển thị chắc chắn; auto-chain qua `Application.Idle`.
+2. **Special area port đúng VBA** `PerformSpecialAreaAdjustment_Phase3`: seed band → xóa lỗ cũ → mọc lại hàng lỗ (`RegenerateSeedLineSpecial` + `TryRayBoundaryIntersection`) + dimension + mark đỏ. Mỗi bước 1 lần chạy POST, hiện lỗ rồi tự hỏi lại (cờ `ContinueSpecial`).
+3. **Hướng special = CHUỘT** (rubber-band từ START), bỏ P1/P2 keyword.
+4. **Audit trong block** — `CollectCircleCentersWorld` quét cả trong BlockReference (transform world); spacing + interference đều chạy không cần phá block.
+5. **Command line = English** toàn bộ (memory `command-line-english`).
+
+### CÒN LẠI vs VBA (ưu tiên cho phiên sau)
+- [ ] **Runtime-test** special-area mới (mouse dir, seed regen, mark đỏ) + audit trong block — CHƯA kiểm chứng trên AutoCAD.
+- [ ] **Logic rải lỗ (PHASE 1)** — rà lại `GenerateCentralPoints`/`GenerateLineOfPoints` so VBA: gap Case1/2/3, retreat, reposition Li-1, thứ tự 4 hướng, unique X×Y. User nói phần rải lỗ còn cần chỉnh.
+- [ ] **Local adjustment** — `LocalAdjustRedHoles` (C#) vs `PerformLocalAdjustments_Phase2` (VBA, dòng ~?): đối chiếu 8-hướng (`FindClosestSafe*Shift_Local`, `FindBestSafeComplexShift_Local` dòng 1610-1717), thứ tự ưu tiên, dimension.
+- [ ] **Vá degenerate-guard** `GetSmartRectEdges` (fallback bbox khi 1 trục chỉ có 1 cạnh dài) — đã bàn, CHƯA áp.
+- [ ] Dọn P1/P2 vestigial trong `LashingWorkflowState` (không còn dùng sau khi special dùng mouse).
+- [ ] (Tùy chọn) cloud-mark audit đặt ở model space phủ block — nếu muốn mark NẰM TRONG block cần bước mở định nghĩa block.
+
+### Nguồn đối chiếu
+- VBA gốc: `../vba_src/mod_MainLashingHole_V3.bas` (memory `vba-source-of-truth`). Extractor: `scratchpad/vbaextract`.
+
+---
+
+## Session 2026-08-01 22:22
+
+### User yêu cầu
+- Dùng **tiếng Anh** cho TẤT CẢ text hiển thị ở command line (prompt + message + error), KHÔNG tiếng Việt.
+
+### Đã làm
+- Dịch sang English mọi `ed.WriteMessage`, prompt (`PromptPointOptions`/`SetRejectMessage`...), và audit `message` còn tiếng Việt trong: `LashingWorkflowService.cs`, `LashingHoleCommands.cs`, `InterferenceAuditService.cs`.
+- Comment `///` và `//` GIỮ tiếng Việt (theo CLAUDE.md §5); Debug.WriteLine vốn đã English.
+- Đây là override CLAUDE.md §5 ("error message → tiếng Việt") → đã ghi memory `command-line-english`.
+
+### Trạng thái
+- Build PASS (`MCG_LashingHole_20260801_222200.dll`). Grep xác nhận không còn tiếng Việt trong string command-line.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges`.
+
+---
+
+## Session 2026-08-01 22:09
+
+### User yêu cầu (2 điểm)
+1. Special area: hướng điều chỉnh nên chọn bằng **HƯỚNG CHUỘT**, không gán cứng P1/P2.
+2. Audit (spacing + interference) chỉ chạy được khi **phá block** — sai. Phải audit ngay trong block (đã đóng block rồi).
+
+### Đã làm
+**Điểm 1 — hướng bằng chuột:**
+- `RegenerateSpecialArea`: đổi tham số `dirChoice/p1/p2` → `int genDir` (bỏ tính genDir per-seed từ P1/P2).
+- `RunPostProcess`: sau khi chọn START/END, đọc tâm 2 lỗ → xác định trục (cùng Y→cột dọc), rồi **`ed.GetPoint` với rubber-band từ lỗ START** để user click chỉ hướng → `genDir = Sign(pick - startC)` trên trục phát triển.
+- State P1/P2 giờ vô dụng cho special (vẫn set ở RunGenerate, để lại — vô hại).
+
+**Điểm 2 — audit trong block (không phá block):**
+- `AutoCADGeometryHelper.CollectCircleCentersWorld(tr, space, boundary, layer, radius, rTol)`: quét circle ở model space TOP-LEVEL **và bên trong mọi BlockReference** (transform tâm qua `BlockTransform`), trả tâm world trong boundary. Block đóng ở scale 1, insert=Origin=basePt nên BlockTransform ≈ identity → tâm giữ world.
+- `InterferenceAuditService.RunAudit`: dùng collector → dựng Circle ẢO (RAM) ở tâm world để `IntersectWith` cấu kiện (bỏ `CollectOuterCircles`). Cloud-mark chèn ở model space tại tâm world (KHÔNG nhét vào trong block).
+- `RunSpacingAudit` + `BuildAuditReport(List<Point3d>)`: dùng collector cho inner hole.
+
+### Trạng thái
+- Build PASS (`MCG_LashingHole_20260801_220903.dll`). CHƯA test runtime.
+- Lưu ý: cloud-mark & báo cáo audit đặt/tính ở model space phủ lên block — KHÔNG sửa định nghĩa block. Nếu user muốn mark NẰM TRONG block thì cần bước riêng.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges`.
+- P1/P2 trong LashingWorkflowState nay vô dụng — dọn sau nếu cần.
+
+### Ghi chú API
+- `BlockReference.BlockTransform` = ma trận block-def → world; `center.TransformBy(xform)` cho tâm world (khớp Explode). Dùng để audit lỗ nằm trong block mà không phá block.
+- `Circle` ẢO (không AppendEntity) vẫn `IntersectWith` được với entity trong DB — phép toán hình học thuần, không cần circle nằm trong database.
+
+---
+
+## Session 2026-08-01 17:46
+
+### Bối cảnh (user test bản split RUN/POST)
+- ✅ Lỗ generate ĐÃ hiện trước prompt special area (điểm 1 đóng).
+- ❌ Special area SAI hoàn toàn: thiếu prompt hướng, "không lỗ nào được điều chỉnh", chỉ thêm 2 lỗ.
+
+### Trích lại VBA gốc để đối chiếu
+- Viết extractor CFBF + MS-OVBA (`scratchpad/vbaextract`) → trích 6 module ra `../vba_src/`.
+- Đọc `PerformSpecialAreaAdjustment_Phase3` (dòng 1330) + `RegenerateLineFromSeed_Special` (1538) + `FindIntersectionWithLongLine_Helper` (2540).
+- **Thuật toán VBA thật**: chọn START+END outer → hỏi **"Direction towards P1 or P2?"** → xác định trục (2 lỗ CÙNG Y → mọc CỘT DỌC) → seedHoles = mọi outer trên đường START giữa START↔END → mỗi seed: **XÓA lỗ cũ phía genDir** + **mọc lại 1 hàng lỗ mới** (spacing + retreat né va chạm) tới biên (giao boundary − offset) + dimension → vẽ dual-circle + tô ĐỎ nếu còn va chạm.
+- Code CŨ (`CalculateIntermediateCoords`) chỉ "fill gap giữa 2 lỗ" → hoàn toàn khác VBA.
+
+### Đã làm (port trung thành Phase 3)
+- `Utilities/AutoCADGeometryHelper.cs`: thêm `TryRayBoundaryIntersection` (bắn tia RAM, port FindIntersectionWithLongLine_Helper).
+- `Services/GridEngineService.cs`: thêm `RegenerateSeedLineSpecial` (port RegenerateLineFromSeed_Special — mọc hàng từ seed, KHÔNG có gap Case1/2/3).
+- `Services/GridGenerationService.cs`: **viết lại** `RegenerateSpecialArea` đúng VBA (seed detection, delete-beyond-seed, regen line, dims, mark đỏ). Bỏ `CalculateIntermediateCoords`.
+- `Services/LashingWorkflowService.cs`: state thêm P1/P2 + cờ `ContinueSpecial`; special-area đổi từ while-loop → **1 bước/lần chạy POST** (thêm prompt hướng P1/P2), kết thúc lệnh → repaint → tự re-chain POST qua Idle để user THẤY lỗ mới trước khi hỏi tiếp.
+- `Commands/LashingHoleCommands.cs`: `RunLashingPost` re-hook Idle khi `ContinueSpecial`.
+
+### Trạng thái
+- Build PASS (`MCG_LashingHole_20260801_174610.dll`). CHƯA test runtime.
+- Kỳ vọng: special area giờ hỏi hướng P1/P2, xóa+mọc lại hàng lỗ, hiện ra sau mỗi bước.
+
+### Ghi chú API
+- `.dvb` = OLE compound (CFBF) + VBA nén MS-OVBA. Extractor tự viết: quét stream tìm sig 0x01 → decompress → giữ block chứa "Attribute VB_Name". Nguồn VBA ở `vba_src/mod_MainLashingHole_V3.bas` (134KB).
+- VBA `isVerticalRegen = |startY - endY| < EPS` (2 lỗ cùng Y → mọc các đường DỌC). axisIsX = !isVerticalRegen.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges`.
+
+---
+
+## Session 2026-08-01 16:34
+
+### Đã làm (điểm 1 — lỗ hiện muộn: FIX TRIỆT ĐỂ bằng tách lệnh)
+- User xác nhận `ed.Regen()` + `ed.UpdateScreen()` VẪN không hiện lỗ trước prompt special area.
+- Kiểm chứng `SafeRun` KHÔNG bọc transaction ngoài → commit ở PHASE 1 là final. Kết luận: **AutoCAD batch graphics trong 1 lệnh modal — chỉ repaint khi lệnh trả về "Command:"**. Regen/UpdateScreen giữa lệnh không flush.
+- **Giải pháp**: tách `RunCreateFlow` thành 2 lệnh:
+  - `MCG_LH_RUN` → `RunGenerate()`: boundary → structures → adjacent → P1/P2 → PHASE 1 (sinh lưới + vẽ + dimension) → commit → **KẾT THÚC lệnh** (AutoCAD repaint → lỗ chắc chắn hiển thị). Lưu state qua `LashingWorkflowState`.
+  - `MCG_LH_POST` → `RunPostProcess()`: special area loop → local adjust → đóng block. Đọc state.
+  - Auto-chain single-click: sau `RunGenerate`, hook `Application.Idle` (one-shot) → khi AutoCAD rảnh (đã repaint xong lỗ) → `SendStringToExecute("MCG_LH_POST ")`. User vẫn chỉ bấm START 1 lần.
+- File sửa: `Services/LashingWorkflowService.cs` (thêm class `LashingWorkflowState`; tách RunGenerate/RunPostProcess), `Commands/LashingHoleCommands.cs` (lệnh MCG_LH_POST + hook Idle).
+
+### Trạng thái
+- Build PASS (`MCG_LashingHole_20260801_163417.dll`). CHƯA test runtime.
+- Kỳ vọng: sau boundary/structure/P1P2 → lỗ HIỆN → rồi mới hỏi special area. Nếu OK, điểm 1 đóng.
+- Lưu ý phụ (chưa xử lý): lỗ trung gian trong vòng special-area / local-adjust vẫn có thể hiện muộn cùng lý do (batch trong lệnh POST). Chờ user xác nhận điểm chính trước.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges`.
+
+### Ghi chú API
+- Entity chỉ repaint khi lệnh modal trả về "Command:". Muốn user thấy kết quả GIỮA chuỗi bước → phải KẾT THÚC lệnh, dùng `Application.Idle` (one-shot) + `SendStringToExecute` để tự chạy bước kế → giữ trải nghiệm 1-click.
+- `Application.Idle` fire liên tục khi rảnh → BẮT BUỘC gỡ handler (`-=`) ngay đầu callback (one-shot), nếu không sẽ lặp vô hạn lệnh POST.
+
+---
+
+## Session 2026-08-01 15:53
+
+### Đã làm
+- User xác nhận điểm 2 (dimension vào block) OK.
+- Điểm 1 CHƯA hết: `ed.Regen()` không đủ — chỉ đánh dấu regen, chưa đẩy ra màn hình khi lệnh đang chạy → lỗ vẫn hiện cuối lệnh.
+- Vá: thêm `ed.UpdateScreen()` ngay sau mỗi `ed.Regen()` (3 chỗ) — ép vẽ ra màn hình để lỗ hiện NGAY sau generate, trước prompt special area/local (user cần thấy lỗ để quyết định).
+
+### Trạng thái
+- Build PASS (`MCG_LashingHole_20260801_155343.dll`). CHƯA test runtime.
+- Nếu UpdateScreen vẫn không hiện lỗ → nghi ngờ graphics bị batch trong ngữ cảnh SendStringToExecute; phương án dự phòng: đổi cách flush (Application-level) hoặc tách generate ra command riêng.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges`.
+
+### Ghi chú API
+- `Editor.Regen()` = mark-for-regen (như VBA Regen nhưng chưa chắc repaint mid-command); `Editor.UpdateScreen()` = ép flush graphics ra màn hình ngay. Cần CẢ HAI khi muốn entity hiện giữa các prompt trong 1 lệnh.
+
+---
+
+## Session 2026-08-01 15:22
+
+### Đã làm (user report: thứ tự flow sai + dimension không vào block)
+
+**Điểm 1 — Thiếu Regen khiến flow NHÌN như sai thứ tự** (code order vốn ĐÚNG VBA):
+- Xác nhận `RunCreateFlow`: generate (PHASE 1, dòng 158) CHẮC CHẮN trước special area (204) trước local adjust (245) trước block — đúng VBA, cả auto/manual.
+- Root cause user thấy "special area hỏi trước generate": PHASE 1 vẽ lỗ vào DB nhưng **thiếu `Regen`** (VBA gọi `Regen acAllViewports` sau mỗi phase) → màn hình chưa refresh → lỗ hiện muộn (cuối lệnh) → tưởng generate chạy sau. Auto mode: mọi bước trước special area đều im lặng → prompt special area hiện "ngay" sau boundary.
+- Vá: thêm `ed.Regen()` sau PHASE 1, sau special-area loop, sau local adjust.
+
+**Điểm 2 — Dimension bị bỏ sót khỏi block** (chọn Cách A):
+- `CollectLashingEntities`: test cũ gom dim theo TÂM bbox của dim. Dim đặt lệch 150mm ra ngoài lỗ → tâm rơi ngoài biên → bị loại → nằm rời, không vào block.
+- Vá (Cách A): với `AlignedDimension` test theo ĐIỂM ĐO `XLine1Point`/`XLine2Point` (= tâm lỗ / mép panel, luôn trong/trên biên) bằng `IsInsidePolylineOrEdge`; dim loại khác fallback extents-giao-bbox.
+
+### Trạng thái
+- Build PASS. CHƯA test runtime — cần user test bản `MCG_LashingHole_20260801_152247.dll` để xác nhận (a) lỗ hiện ngay sau generate, (b) dimension vào block.
+
+### Đang treo (chưa áp)
+- Vá degenerate-guard `GetSmartRectEdges` (fallback bbox khi maxX≤minX). User đã duyệt (AskUserQuestion) nhưng tạm hoãn để trao đổi — CHƯA ghi vào file.
+
+### Ghi chú API
+- `Editor.Regen()` — refresh viewport như VBA `ThisDrawing.Regen acAllViewports`; gọi NGOÀI transaction.
+- `AlignedDimension.XLine1Point`/`XLine2Point` = 2 điểm đo gốc (definition points), luôn nằm trong/trên biên → test robust hơn tâm bbox của cả dimension.
+
+---
+
+## Session 2026-07-24 13:13
+
+### Đã làm — KHÔI PHỤC nguyên tắc CẠNH-DÀI 1500mm cho P1/P2 auto (port VBA GetSmartRectangularPointsFromPolyline)
+
+- **`AutoCADGeometryHelper.GetSmartRectEdges(poly, fbMin, fbMax, out minX/maxX/minY/maxY)`** — thuần hình học, không phụ thuộc Models:
+  - Duyệt từng cạnh (khép vòng `(i+1)%n` như VBA), bỏ cạnh cong (`GetBulgeAt` ≥ 0.001) và cạnh ngắn ≤ 1500mm.
+  - Cạnh đứng (Δx<1mm) → minX/maxX; cạnh ngang (Δy<1mm) → minY/maxY. Fallback per-axis về bbox.
+- **`GridEngineService`** (auto overload): P1/P2 + effCenter (P1 mode) lấy từ `GetSmartRectEdges`; **giới hạn phát triển lưới vẫn dùng full bbox** (`GetSmartRectFromPolyline`) — đúng VBA (B_abs riêng, smart rect riêng).
+- **`LashingWorkflowService`**: thay `DeriveP1P2(box, mode)` (bbox góc) bằng `GetSmartP1P2(db, boundaryId, box, mode)` — mở boundary, gọi GetSmartRectEdges, gán góc theo mode. Xoá DeriveP1P2. Log ghi "long-edge 1500mm".
+
+### Kiểm chứng (standalone test scratchpad/collisiontest/SmartRect.cs)
+- Panel 4000×4000 có MẤU LỒI ra X=4300 (các cạnh mấu đều ngắn): **bbox = X[0,4300]** (gồm mấu) vs **smart rect = X[0,4000]** (bỏ mấu, bám mép chính) ✅. Chữ nhật sạch → smart = 0..4000 cả 2 trục ✅.
+
+### Trạng thái
+- Build PASS. 2 test standalone PASS (tránh va chạm + smart rect). CHƯA test runtime AutoCAD.
+
+### Ghi chú
+- Quirk VBA giữ nguyên: nếu 1 cạnh bị chẻ hết thành đoạn < 1500mm thì trục đó chỉ nhận cạnh dài còn lại (có thể suy biến min=max) — port trung thành, không "sửa khôn".
+- `boundary.GetBulgeAt(i)` / `GetPoint2dAt((i+1)%n)` — hợp lệ cả polyline kín lẫn hở (hở: có cạnh khép ảo như VBA).
+
+---
+
+## Session 2026-07-23 11:44
+
+### Đã làm — KIỂM TRA + VÁ LOGIC TRÁNH VA CHẠM (user báo "logic không chạy")
+
+**Kiểm chứng bằng test độc lập** (scratchpad/collisiontest — pure geometry, không cần AutoCAD):
+- Tái hiện chính xác ClassifyCollision + FindSafePoint + vòng vẽ DrawHolesWithDimensions.
+- Kịch bản panel 3000×2000, plate đứng X=1000 + stiffener ngang Y=1000: 11/35 lỗ va chạm ban đầu → **sau FindSafePoint cả 11 dời an toàn, 0 lỗ còn đè**.
+- KẾT LUẬN: thuật toán tránh va chạm ĐÚNG và có chạy. Nhưng test lộ 2 lỗ hổng tầng dữ liệu.
+
+**Vá 1 — ClassifyCollision ép 2D** (`CollisionEngineService`):
+- Trước: `center.DistanceTo(closestPt)` tính 3D. Nếu cấu kiện có elevation Z≠0 → distance phồng > clearance → BỎ SÓT va chạm → lỗ xuyên cấu kiện ("logic không chạy").
+- Nay: chiếu tâm về Z=0, tính distance 2D (bỏ Z).
+
+**Vá 2 — Phân loại hướng "smart" theo tangent cấu kiện** (`ClassifyDirection`):
+- Trước: dùng vector tâm→điểm-gần-nhất. Lỗ nằm ĐÚNG trên cấu kiện → delta≈0 → luôn Complex → mất tính "né ngang cho plate đứng / né dọc cho stiffener ngang".
+- Nay: lấy `curve.GetFirstDerivative` tại điểm gần nhất → tangent dọc = cấu kiện đứng → Vertical (né ngang); tangent ngang = Horizontal (né dọc). Fallback về vector cũ nếu không lấy được tangent. Test xác nhận Vertical/Horizontal kích hoạt đúng.
+
+**Chẩn đoán runtime** (`BlockPackingService.DrawStats` + `LashingWorkflowService`):
+- PHASE 1 giờ in ra command line: `[structures=N, grid=N, collided=N, relocated=N, red(stuck)=N]`.
+- Nếu `structures=0` → cảnh báo rõ "không có cấu kiện để tránh va chạm" (giúp phân biệt lỗi chọn cấu kiện vs lỗi thuật toán).
+
+### Trạng thái
+- Build PASS. Test standalone PASS. CHƯA test runtime AutoCAD — nhưng lần chạy tới sẽ có số liệu chẩn đoán ngay trên command line.
+
+### Bước tiếp theo / cần user xác nhận
+- Chạy `MCG_LH_RUN`, đọc dòng `[structures=... collided=... relocated=...]`:
+  - `structures=0` → vấn đề ở SelectStructuresByCrossing (filter/crossing), KHÔNG phải thuật toán.
+  - `structures>0, collided=0` mà mắt thấy lỗ đè → cấu kiện dạng polyline KÍN bọc lỗ (GetClosestPointTo chỉ bắt cạnh; lỗ nằm sâu bên trong không bị bắt — giống hạn chế VBA IntersectWith). Cần point-in-polygon cho cấu kiện kín (enhancement ngoài VBA).
+  - `collided>0, relocated>0` → tránh va chạm đang chạy đúng.
+
+### Ghi chú API
+- `Curve.GetParameterAtPoint(cp)` + `GetFirstDerivative(param)` → tangent cấu kiện; bọc try/catch vì GetParameterAtPoint có thể ném nếu điểm lệch curve do sai số.
+
+---
+
 ## Session 2026-07-23 09:40
 
 ### Đã làm

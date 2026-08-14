@@ -59,10 +59,12 @@ namespace MCG_CreateLashingHole.Services
             _boundary   = boundary;
 
             // Bounding box tuyệt đối tính từ đỉnh polyline (khớp VBA B_abs_min/max)
+            // Full bbox — dùng làm GIỚI HẠN phát triển lưới (B_abs của VBA)
             var (min, max) = AutoCADGeometryHelper.GetSmartRectFromPolyline(boundary);
-            double bMinX = min.X, bMaxX = max.X, bMinY = min.Y, bMaxY = max.Y;
 
-            double stdMaxRetreat = 2.0 * p.ClearanceRadius + STD_MAX_RETREAT_ADDON;
+            // Mép tham chiếu P1/P2 theo nguyên tắc CẠNH DÀI 1500mm (VBA), fallback full bbox
+            AutoCADGeometryHelper.GetSmartRectEdges(boundary, min, max,
+                out double rMinX, out double rMaxX, out double rMinY, out double rMaxY);
 
             // Xác định P1/P2 + start option + effective center theo LocationMode
             Point3d p1, p2, effCenter;
@@ -72,25 +74,25 @@ namespace MCG_CreateLashingHole.Services
             {
                 case LashingLocationMode.StarBoard:
                     // P1 = Trên-Trái, P2 = Dưới-Phải
-                    p1 = new Point3d(bMinX, bMaxY, 0);
-                    p2 = new Point3d(bMaxX, bMinY, 0);
-                    effCenter   = new Point3d((bMinX + bMaxX) / 2.0, (bMinY + bMaxY) / 2.0, 0);
+                    p1 = new Point3d(rMinX, rMaxY, 0);
+                    p2 = new Point3d(rMaxX, rMinY, 0);
+                    effCenter   = new Point3d((rMinX + rMaxX) / 2.0, (rMinY + rMaxY) / 2.0, 0);
                     startOption = "P1";
                     break;
 
                 case LashingLocationMode.Center:
                     // Cải tiến kiến trúc mới: dùng polygon centroid làm effective center
-                    p1 = new Point3d(bMinX, bMinY, 0);
-                    p2 = new Point3d(bMaxX, bMaxY, 0);
+                    p1 = new Point3d(rMinX, rMinY, 0);
+                    p2 = new Point3d(rMaxX, rMaxY, 0);
                     effCenter   = AutoCADGeometryHelper.GetPolygonCentroid(boundary);
                     startOption = "Center";
                     break;
 
                 default: // PortSide
                     // P1 = Dưới-Trái, P2 = Trên-Phải
-                    p1 = new Point3d(bMinX, bMinY, 0);
-                    p2 = new Point3d(bMaxX, bMaxY, 0);
-                    effCenter   = new Point3d((bMinX + bMaxX) / 2.0, (bMinY + bMaxY) / 2.0, 0);
+                    p1 = new Point3d(rMinX, rMinY, 0);
+                    p2 = new Point3d(rMaxX, rMaxY, 0);
+                    effCenter   = new Point3d((rMinX + rMaxX) / 2.0, (rMinY + rMaxY) / 2.0, 0);
                     startOption = "P1";
                     break;
             }
@@ -122,6 +124,77 @@ namespace MCG_CreateLashingHole.Services
 
             System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} GenerateGrid xong: {result.Count} điểm.");
             return result;
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // Special area — port RegenerateLineFromSeed_Special
+        // Mọc 1 HÀNG lỗ từ seed → endAnchor tại spacing, né va chạm bằng retreat.
+        // KHÁC GenerateLineOfPoints: KHÔNG có gap-handling Case1/2/3 (bám đúng VBA Phase 3).
+        // ─────────────────────────────────────────────────────────────
+        public List<Point3d> RegenerateSeedLineSpecial(
+            LashingInputParams p, Polyline boundary,
+            IList<Entity> structures, IList<Line3d> keepOut,
+            Point3d seedPt, Point3d endPt,
+            double spacing, int genDir, bool axisIsX,
+            double boundaryMin, double boundaryMax)
+        {
+            _structures = structures ?? new List<Entity>();
+            _keepOut    = keepOut ?? new List<Line3d>();
+            _clearance  = p.ClearanceRadius;
+            _boundary   = boundary;
+            double stdMaxRetreat = 2.0 * p.ClearanceRadius + STD_MAX_RETREAT_ADDON;
+
+            var dict = new Dictionary<string, Point3d>();
+            double fixedCoord = axisIsX ? seedPt.Y : seedPt.X;
+            double seedVary   = axisIsX ? seedPt.X : seedPt.Y;
+            double endVary    = axisIsX ? endPt.X  : endPt.Y;
+
+            AddPointVary(dict, seedVary, fixedCoord, axisIsX);
+            double lastValid = seedVary;
+
+            // --- điểm trung gian ---
+            int loop = 0;
+            while (loop < MAX_ITER_PER_LINE)
+            {
+                loop++;
+                double cand = lastValid + genDir * spacing;
+
+                if ((genDir == 1 && cand > endVary - EPS) || (genDir == -1 && cand < endVary + EPS)) break;
+                if (cand < boundaryMin || cand > boundaryMax) break;
+
+                if (Collides(cand, fixedCoord, axisIsX))
+                {
+                    double tmp = cand;
+                    if (AdjustPointAlongAxis(ref tmp, fixedCoord, axisIsX, genDir,
+                        stdMaxRetreat, lastValid, spacing, boundaryMin, boundaryMax, false))
+                        cand = tmp;
+                    else break;
+                }
+
+                if ((genDir == 1 && cand > endVary - EPS) || (genDir == -1 && cand < endVary + EPS)) break;
+
+                AddPointVary(dict, cand, fixedCoord, axisIsX);
+                lastValid = cand;
+            }
+
+            // --- End anchor (isSeedAdj = true) ---
+            if (endVary >= boundaryMin && endVary <= boundaryMax)
+            {
+                double li = endVary;
+                bool ok = true;
+                if (Collides(li, fixedCoord, axisIsX))
+                {
+                    double tmp = li;
+                    if (AdjustPointAlongAxis(ref tmp, fixedCoord, axisIsX, genDir,
+                        stdMaxRetreat, lastValid, spacing, boundaryMin, boundaryMax, true))
+                        li = tmp;
+                    else ok = false;
+                }
+                if (ok && Math.Abs(li - lastValid) > spacing * MIN_DIST_FACTOR_AFTER_RETREAT)
+                    AddPointVary(dict, li, fixedCoord, axisIsX);
+            }
+
+            return dict.Values.ToList();
         }
 
         // ─────────────────────────────────────────────────────────────

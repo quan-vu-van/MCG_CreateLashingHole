@@ -13,7 +13,8 @@ namespace MCG_CreateLashingHole.Services
     /// <summary>
     /// Rải lưới lỗ lashing trên tấm biên:
     ///   • Vẽ DUAL CIRCLE (innerCircle = lỗ thực / outerCircle = vùng clearance)
-    ///   • Né cấu kiện bằng 8-direction safe point search
+    ///   • Generate CHỈ tô ĐỎ lỗ va chạm (khớp VBA CheckAndHighlightConflicts) — KHÔNG dời lỗ;
+    ///     việc dời 8-hướng là của bước LOCAL ADJUST sau đó
     ///   • Ghi kích thước CHỈ cho các lỗ bị điều chỉnh (adjusted holes)
     ///   • Effective center dùng polygon centroid (không phải midpoint bounding box)
     /// </summary>
@@ -26,6 +27,15 @@ namespace MCG_CreateLashingHole.Services
 
         private const double DIMSCALE  = 25.0;
         private const double TOLERANCE = 1.0;
+
+        /// <summary>Số liệu chẩn đoán 1 lần vẽ — để flow báo ra command line</summary>
+        public struct DrawStats
+        {
+            public int Total;      // tổng lỗ vẽ
+            public int Collided;   // số điểm lưới va chạm ban đầu
+            public int Relocated;  // số lỗ đã dời được ra vị trí an toàn
+            public int Red;        // số lỗ không né được → tô đỏ
+        }
 
         // Track vị trí đã điều chỉnh để tạo dimension (Gap #9)
         private readonly struct AdjustedHole
@@ -91,7 +101,7 @@ namespace MCG_CreateLashingHole.Services
                 : new Point3d(box.MinPoint.X, box.MinPoint.Y, 0);
 
             return DrawHolesWithDimensions(p, boundary, structures, keepOutZones, gridPoints, p1Auto,
-                box.MinPoint.X, box.MaxPoint.X, box.MinPoint.Y, box.MaxPoint.Y, tr, space, db);
+                box.MinPoint.X, box.MaxPoint.X, box.MinPoint.Y, box.MaxPoint.Y, tr, space, db, out _);
         }
 
         /// <summary>
@@ -108,8 +118,10 @@ namespace MCG_CreateLashingHole.Services
             double rectMinX, double rectMaxX, double rectMinY, double rectMaxY,
             Transaction        tr,
             BlockTableRecord   space,
-            Database           db)
+            Database           db,
+            out DrawStats      stats)
         {
+            stats = new DrawStats();
             double radius = p.HoleDiameter / 2.0;
             EnsureLayerExists(LashingInputParams.LAYER_INNER_HOLE,  db, tr);
             EnsureLayerExists(LashingInputParams.LAYER_OUTER_CLEAR, db, tr);
@@ -130,23 +142,13 @@ namespace MCG_CreateLashingHole.Services
                 bool collides = col.CollisionOccurred ||
                                 HasKeepOutCollision(candidate, p.ClearanceRadius, keepOutZones);
 
-                // Né va chạm bằng 8-direction search. Nếu KHÔNG né được → giữ tại vị trí lưới
-                // và tô ĐỎ outer circle (khớp VBA CheckAndHighlightConflicts + Phase 2:
-                // lỗ dịch được reset ByLayer, lỗ không dịch được giữ acRed làm cảnh báo).
+                // VBA: bước GENERATE chỉ VẼ lỗ + TÔ ĐỎ lỗ va chạm (CheckAndHighlightConflicts — chỉ đổi
+                // màu, KHÔNG dời lỗ). Việc DỜI lỗ va chạm (8-hướng) là nhiệm vụ của bước LOCAL ADJUST
+                // phía sau (PerformLocalAdjustments_Phase2). KHÔNG relocate ở generate — nếu không,
+                // local adjust thành thừa và prompt "Perform local adjustment?" trở nên vô nghĩa.
                 Point3d finalPt = candidate;
-                bool    markRed = false;
-                if (collides)
-                {
-                    Point3d safe = _collision.FindSafePoint(
-                        candidate, p.ClearanceRadius, structures, keepOutZones,
-                        boundary, col.CollisionType);
-
-                    if (safe.DistanceTo(candidate) > TOLERANCE &&
-                        AutoCADGeometryHelper.IsInsidePolylineOrEdge(safe, boundary))
-                        finalPt = safe;      // dịch được → ByLayer
-                    else
-                        markRed = true;      // không dịch được → giữ tại lưới, tô đỏ
-                }
+                bool    markRed = collides;
+                if (collides) { stats.Collided++; stats.Red++; }
 
                 // Vẽ DUAL CIRCLE — inner ByLayer; outer tô đỏ nếu va chạm không né được
                 ObjectId innerId = DrawCircle(finalPt, radius, LashingInputParams.LAYER_INNER_HOLE,
@@ -160,6 +162,7 @@ namespace MCG_CreateLashingHole.Services
                 if (!markRed && finalPt.DistanceTo(candidate) > TOLERANCE)
                     adjusted.Add(new AdjustedHole(candidate, finalPt));
             }
+            stats.Total = innerIds.Count;
 
             // FULL DIMENSIONING — chuỗi dim liên tục theo hàng/cột dài nhất, mốc = dimOrigin (P1)
             AddContinuousDimensions(drawnPoints, dimOrigin,
@@ -286,16 +289,27 @@ namespace MCG_CreateLashingHole.Services
                 }
                 else if (ent is Dimension dim && dim.Layer == LashingInputParams.LAYER_DIMENSION)
                 {
-                    try
+                    // Dim đặt LỆCH ra ngoài lỗ (offset 150mm) → tâm bbox của dim có thể nằm NGOÀI
+                    // biên → test cũ loại nhầm, dim bị bỏ sót khỏi block. Nay test theo ĐIỂM ĐO
+                    // (XLine1/XLine2 = tâm lỗ hoặc mép panel — luôn nằm trong/trên biên).
+                    if (dim is AlignedDimension ad)
                     {
-                        Extents3d de = dim.GeometricExtents;
-                        var       mid = new Point3d((de.MinPoint.X + de.MaxPoint.X) / 2.0,
-                                                    (de.MinPoint.Y + de.MaxPoint.Y) / 2.0, 0);
-                        if (mid.X >= bbox.MinPoint.X && mid.X <= bbox.MaxPoint.X &&
-                            mid.Y >= bbox.MinPoint.Y && mid.Y <= bbox.MaxPoint.Y)
+                        if (AutoCADGeometryHelper.IsInsidePolylineOrEdge(ad.XLine1Point, boundary) ||
+                            AutoCADGeometryHelper.IsInsidePolylineOrEdge(ad.XLine2Point, boundary))
                             result.Add(id);
                     }
-                    catch { }
+                    else
+                    {
+                        // Dim loại khác: fallback — extents giao với bbox biên (không chỉ tâm)
+                        try
+                        {
+                            Extents3d de = dim.GeometricExtents;
+                            if (de.MaxPoint.X >= bbox.MinPoint.X && de.MinPoint.X <= bbox.MaxPoint.X &&
+                                de.MaxPoint.Y >= bbox.MinPoint.Y && de.MinPoint.Y <= bbox.MaxPoint.Y)
+                                result.Add(id);
+                        }
+                        catch { }
+                    }
                 }
             }
             return result;

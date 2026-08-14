@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
-using AcRuntime = Autodesk.AutoCAD.Runtime;
 using MCG_CreateLashingHole.Models;
 using MCG_CreateLashingHole.Utilities;
 
@@ -40,43 +39,47 @@ namespace MCG_CreateLashingHole.Services
                 else blockOk = false;
             }
 
-            // 2) Thu thập outer clearance circle trong boundary
-            var outerCircles = CollectOuterCircles(p, boundary, tr, space);
-            if (outerCircles.Count == 0)
+            // 2) Thu thập tâm outer clearance circle trong boundary — QUÉT CẢ trong block (không phá block)
+            var outerCenters = AutoCADGeometryHelper.CollectCircleCentersWorld(
+                tr, space, boundary, LashingInputParams.LAYER_OUTER_CLEAR, p.ClearanceRadius, R_TOL);
+            if (outerCenters.Count == 0)
             {
-                message = "AUDIT: Không tìm thấy outer clearance circle nào trong boundary.";
+                message = "AUDIT: No outer clearance circle found inside the boundary.";
                 return 0;
             }
             if (structures == null || structures.Count == 0)
             {
-                message = "AUDIT: Chưa chọn cấu kiện để kiểm tra va chạm.";
+                message = "AUDIT: No structures selected for interference check.";
                 return 0;
             }
 
-            // 3) Kiểm tra giao cắt từng lỗ × cấu kiện
+            // 3) Kiểm tra giao cắt từng lỗ × cấu kiện (dựng circle ẢO ở world, không thêm vào DB)
             int marks = 0;
-            foreach (var circle in outerCircles)
+            foreach (var center in outerCenters)
             {
                 bool collided = false;
-                foreach (var s in structures)
+                using (var wc = new Circle(center, Vector3d.ZAxis, p.ClearanceRadius))
                 {
-                    if (CircleHitsStructure(circle, s)) { collided = true; break; }
+                    foreach (var s in structures)
+                    {
+                        if (CircleHitsStructure(wc, s)) { collided = true; break; }
+                    }
                 }
                 if (!collided) continue;
 
                 marks++;
                 if (blockOk)
                 {
-                    var bref = new BlockReference(circle.Center, blkId) { Layer = LashingInputParams.LAYER_OUTER_CLEAR };
+                    var bref = new BlockReference(center, blkId) { Layer = LashingInputParams.LAYER_OUTER_CLEAR };
                     space.AppendEntity(bref);
                     tr.AddNewlyCreatedDBObject(bref, true);
                 }
             }
 
-            string blkNote = blockOk ? "" : $" (⚠ {blkMsg} — không chèn được cloud mark)";
+            string blkNote = blockOk ? "" : $" ({blkMsg} - cloud mark could not be inserted)";
             message = marks == 0
-                ? "AUDIT: Không có lỗ nào va chạm với cấu kiện."
-                : $"AUDIT: Phát hiện {marks} lỗ va chạm{blkNote}.";
+                ? "AUDIT: No holes interfere with structures."
+                : $"AUDIT: {marks} interfering hole(s) detected{blkNote}.";
 
             System.Diagnostics.Debug.WriteLine($"{LOG_PREFIX} RunAudit xong: {marks} va chạm.");
             return marks;
@@ -105,36 +108,6 @@ namespace MCG_CreateLashingHole.Services
         }
 
         // ─────────────────────────────────────────────────────────────
-        // Thu thập outer clearance circle (layer AM_9, bán kính ≈ clearance) trong boundary
-        // ─────────────────────────────────────────────────────────────
-        private static List<Circle> CollectOuterCircles(
-            LashingInputParams p, Polyline boundary, Transaction tr, BlockTableRecord space)
-        {
-            var    result      = new List<Circle>();
-            double rOuter       = p.ClearanceRadius;
-            var    circleClass  = AcRuntime.RXObject.GetClass(typeof(Circle));
-
-            foreach (ObjectId id in space)
-            {
-                if (!id.IsValid || id.IsErased) continue;
-                if (!id.ObjectClass.IsDerivedFrom(circleClass)) continue; // proxy-safe
-
-                Circle c;
-                try { c = tr.GetObject(id, OpenMode.ForRead) as Circle; }
-                catch { continue; }
-                if (c == null || c.IsErased) continue;
-
-                if (c.Layer == LashingInputParams.LAYER_OUTER_CLEAR &&
-                    Math.Abs(c.Radius - rOuter) < R_TOL &&
-                    AutoCADGeometryHelper.IsInsidePolylineOrEdge(c.Center, boundary))
-                {
-                    result.Add(c);
-                }
-            }
-            return result;
-        }
-
-        // ─────────────────────────────────────────────────────────────
         // Đảm bảo block cảnh báo tồn tại — port DbxCopyBlock (ObjectDBX)
         // ─────────────────────────────────────────────────────────────
         private static bool EnsureInterferenceBlock(Database db, Transaction tr, out string message)
@@ -145,7 +118,7 @@ namespace MCG_CreateLashingHole.Services
 
             if (!File.Exists(SYMBOL_PATH))
             {
-                message = $"Không thấy {SYMBOL_PATH}";
+                message = $"{SYMBOL_PATH} not found";
                 return false;
             }
 
@@ -165,7 +138,7 @@ namespace MCG_CreateLashingHole.Services
 
                     if (ids.Count == 0)
                     {
-                        message = $"Symbol.dwg không chứa block '{BLOCK_NAME}'";
+                        message = $"Symbol.dwg does not contain block '{BLOCK_NAME}'";
                         return false;
                     }
 
@@ -177,7 +150,7 @@ namespace MCG_CreateLashingHole.Services
             }
             catch (Exception ex)
             {
-                message = $"Lỗi copy block: {ex.Message}";
+                message = $"Block copy error: {ex.Message}";
                 return false;
             }
         }

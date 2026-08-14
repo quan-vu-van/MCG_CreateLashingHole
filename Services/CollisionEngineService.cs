@@ -62,29 +62,24 @@ namespace MCG_CreateLashingHole.Services
         {
             var result = new LashingCollisionResult();
 
+            // Toàn bộ bài toán là 2D (bản vẽ panel) — chiếu tâm về Z=0 và bỏ Z khi tính
+            // khoảng cách. Nếu cấu kiện có elevation (Z≠0), tính 3D sẽ làm distance phồng
+            // lên > clearance → BỎ SÓT va chạm (lỗ xuyên qua cấu kiện). Ép 2D để tránh.
+            var c2 = new Point3d(center.X, center.Y, 0);
+
             if (structure is Curve curve)
             {
-                // ✅ GetClosestPointTo — pure geometric query, safe inside transaction
                 try
                 {
-                    Point3d closestPt = curve.GetClosestPointTo(center, false);
-                    double  dist      = center.DistanceTo(closestPt);
+                    Point3d cp   = curve.GetClosestPointTo(c2, false);
+                    double  dx   = c2.X - cp.X, dy = c2.Y - cp.Y;
+                    double  dist = Math.Sqrt(dx * dx + dy * dy); // 2D — bỏ qua Z
                     if (dist >= radius) return result;
 
                     result.CollisionOccurred = true;
-                    double deltaX = Math.Abs(center.X - closestPt.X);
-                    double deltaY = Math.Abs(center.Y - closestPt.Y);
-                    result.DeltaX = deltaX;
-                    result.DeltaY = deltaY;
-
-                    // DeltaX lớn = cấu kiện nằm sang trái/phải = cấu kiện đứng → Vertical
-                    // DeltaY lớn = cấu kiện nằm trên/dưới     = cấu kiện ngang → Horizontal
-                    if (deltaX > deltaY * 5.0 + 1e-6)
-                        result.CollisionType = LashingCollisionType.Vertical;
-                    else if (deltaY > deltaX * 5.0 + 1e-6)
-                        result.CollisionType = LashingCollisionType.Horizontal;
-                    else
-                        result.CollisionType = LashingCollisionType.Complex;
+                    result.DeltaX = Math.Abs(dx);
+                    result.DeltaY = Math.Abs(dy);
+                    result.CollisionType = ClassifyDirection(curve, cp, result.DeltaX, result.DeltaY);
                 }
                 catch { /* Curve suy biến hoặc không hỗ trợ → bỏ qua */ }
             }
@@ -94,15 +89,15 @@ namespace MCG_CreateLashingHole.Services
                 try
                 {
                     Extents3d bbox     = structure.GeometricExtents;
-                    double    closestX = Math.Max(bbox.MinPoint.X, Math.Min(center.X, bbox.MaxPoint.X));
-                    double    closestY = Math.Max(bbox.MinPoint.Y, Math.Min(center.Y, bbox.MaxPoint.Y));
-                    double    dist     = Math.Sqrt(Math.Pow(center.X - closestX, 2) +
-                                                   Math.Pow(center.Y - closestY, 2));
+                    double    closestX = Math.Max(bbox.MinPoint.X, Math.Min(c2.X, bbox.MaxPoint.X));
+                    double    closestY = Math.Max(bbox.MinPoint.Y, Math.Min(c2.Y, bbox.MaxPoint.Y));
+                    double    dist     = Math.Sqrt(Math.Pow(c2.X - closestX, 2) +
+                                                   Math.Pow(c2.Y - closestY, 2));
                     if (dist < radius)
                     {
                         result.CollisionOccurred = true;
-                        result.DeltaX            = Math.Abs(center.X - closestX);
-                        result.DeltaY            = Math.Abs(center.Y - closestY);
+                        result.DeltaX            = Math.Abs(c2.X - closestX);
+                        result.DeltaY            = Math.Abs(c2.Y - closestY);
                         result.CollisionType     = LashingCollisionType.Complex;
                     }
                 }
@@ -110,6 +105,39 @@ namespace MCG_CreateLashingHole.Services
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Phân loại hướng va chạm theo HƯỚNG CẤU KIỆN tại điểm gần nhất (smart, khớp ý VBA):
+        ///   cấu kiện đứng (tangent dọc)  → cần né NGANG → Vertical (DIRS_VERTICAL ưu tiên Right/Left)
+        ///   cấu kiện ngang (tangent ngang) → cần né DỌC → Horizontal (DIRS_HORIZONTAL ưu tiên Up/Down)
+        /// Dùng tangent thay vì vector tâm→điểm gần nhất để đúng cả khi lỗ nằm ĐÚNG trên cấu kiện
+        /// (khi đó delta≈0, vector vô nghĩa). Fallback về vector nếu không lấy được tangent.
+        /// </summary>
+        private static LashingCollisionType ClassifyDirection(Curve curve, Point3d cp,
+            double deltaX, double deltaY)
+        {
+            double sdx = 0, sdy = 0;
+            try
+            {
+                double   param = curve.GetParameterAtPoint(cp);
+                Vector3d tan   = curve.GetFirstDerivative(param);
+                sdx = Math.Abs(tan.X);
+                sdy = Math.Abs(tan.Y);
+            }
+            catch { sdx = 0; sdy = 0; }
+
+            if (sdx > 1e-9 || sdy > 1e-9)
+            {
+                if (sdy > sdx * 5.0) return LashingCollisionType.Vertical;   // cấu kiện đứng
+                if (sdx > sdy * 5.0) return LashingCollisionType.Horizontal; // cấu kiện ngang
+                return LashingCollisionType.Complex;
+            }
+
+            // Fallback: dựa vào vector tâm→điểm gần nhất (lỗ nằm lệch cấu kiện)
+            if (deltaX > deltaY * 5.0 + 1e-6) return LashingCollisionType.Vertical;
+            if (deltaY > deltaX * 5.0 + 1e-6) return LashingCollisionType.Horizontal;
+            return LashingCollisionType.Complex;
         }
 
         /// <summary>Trả về va chạm đầu tiên phát hiện được (worst-first).</summary>
