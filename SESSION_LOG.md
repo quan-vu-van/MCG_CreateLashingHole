@@ -1,3 +1,36 @@
+## Session 2026-08-15 06:03 — 🐞 FIX lỗi netload "Could not load assembly ..._<giây khác>"
+
+### Triệu chứng
+- NETLOAD báo: `Could not load file or assembly 'MCG_LashingHole_20260815_054102' ...` trong khi DLL trên đĩa tên `..._054101` (lệch 1 giây).
+
+### Nguyên nhân gốc (build quirk, KHÔNG phải bug code)
+- `MCG_CreateLashingHole.csproj` đặt `AssemblyName = MCG_LashingHole_$([System.DateTime]::Now...)`.
+- Project `UseWPF=true` → build sinh sub-build tạm `*_wpftmp` để biên dịch XAML, sub-build **evaluate LẠI** project → `DateTime.Now` ra giây khác.
+- DLL đặt tên theo evaluation build chính (054101); URI assembly nhúng trong BAML/`.g.cs` (`InitializeComponent` → `LoadComponent(new Uri("/MCG_LashingHole_...;component/..."))`) theo evaluation _wpftmp (054102) → khi load palette WPF tìm assembly 054102 không thấy → lỗi. Chỉ xảy ra khi 2 evaluation rơi vào 2 giây khác nhau (nên trước đây thỉnh thoảng mới lỗi).
+
+### Sửa (csproj)
+- Sinh timestamp MỘT LẦN ở build chính, ghi ra `%TEMP%\MCG_LashingHole.buildstamp`; sub-build `_wpftmp` (nhận diện qua `MSBuildProjectName.EndsWith('_wpftmp')`) **đọc lại** giá trị đó thay vì `DateTime.Now`. Target `WriteBuildStamp` (BeforeTargets `BeforeBuild;MarkupCompilePass1;GenerateTemporaryTargetAssembly`) ghi file trước khi WPF spawn sub-build.
+- Kiểm chứng: grep tên assembly nhúng BÊN TRONG DLL đã build → chỉ còn ĐÚNG 1 tên = chính nó (cả clean lẫn incremental). Trước đây có 2 tên lệch giây.
+- `.g.cs` trên đĩa vẫn nhảy timestamp do **design-time build của IDE** (C# ext) — vô hại, không vào DLL thật.
+
+### Cần làm
+- NETLOAD DLL **mới nhất** trong `bin\x64\Debug\` (vd `MCG_LashingHole_20260815_060258.dll`), KHÔNG dùng `..._054101` (hỏng).
+
+---
+
+## Session 2026-08-15 05:41 — 🔧 Conform anchor: GIỮ + TÔ ĐỎ khi rút lui thất bại (không DROP)
+
+### Yêu cầu (user)
+- Phase tái tạo cột: nếu anchor mép rút lui không thành công → trước đây DROP (VBA-faithful) → hao hụt lỗ âm thầm. User muốn GIỮ + TÔ ĐỎ để local-adjust 8-hướng xử lý cuối, hoặc user xử lý.
+
+### Sửa
+- `RegenerateSeedLineSpecial` (end-anchor): bỏ cờ `ok`. Rút lui OK → dời tới vị trí sạch; rút lui THẤT BẠI → **giữ li = endVary (còn va chạm)**, vẫn `AddPointVary` (nếu đủ xa lastValid). Downstream `DrawConformHoles`/`RegenerateSpecialArea` tô ĐỎ (GetWorstCollision) → `LocalAdjustRedHoles` (POST/batch) thử 8-hướng → nếu vẫn kẹt thì đỏ cho user.
+- Nhất quán nguyên tắc generate phẳng (mark red, không drop). Lệch VBA nhẹ (VBA `Exit Sub` = drop) — user chủ động chọn.
+- Ảnh hưởng CẢ auto conform lẫn manual special-area (đều dùng RegenerateSeedLineSpecial + mark red downstream).
+- Build PASS (`MCG_LashingHole_20260815_054101.dll`). Cyan diagnostic vẫn bật.
+
+---
+
 ## Session 2026-08-14 23:30 — 💡 ĐỀ XUẤT tương lai cho BATCH (dựa cấu hình panel thật)
 
 > Ghi lại để triển khai sau. Bối cảnh thật (V8–V10): panel là các CỤM P/C/S xếp chồng theo Y (P trên / C giữa / S dưới), nhiều cụm cạnh nhau theo X. Batch hiện đạt: 0 va chạm, cột ≈ thẳng hàng (35/39 khớp ≤1mm), còn 4 cột 1 panel lệch 109mm (centroid vs midpoint / mode).

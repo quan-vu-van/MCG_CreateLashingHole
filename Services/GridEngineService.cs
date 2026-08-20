@@ -181,16 +181,17 @@ namespace MCG_CreateLashingHole.Services
             if (endVary >= boundaryMin && endVary <= boundaryMax)
             {
                 double li = endVary;
-                bool ok = true;
                 if (Collides(li, fixedCoord, axisIsX))
                 {
                     double tmp = li;
                     if (AdjustPointAlongAxis(ref tmp, fixedCoord, axisIsX, genDir,
                         stdMaxRetreat, lastValid, spacing, boundaryMin, boundaryMax, true))
-                        li = tmp;
-                    else ok = false;
+                        li = tmp;                    // rút lui OK → dời tới vị trí sạch
+                    // else: rút lui THẤT BẠI → GIỮ li = endVary (còn va chạm) thay vì DROP.
+                    // Downstream (DrawConformHoles/RegenerateSpecialArea) sẽ tô ĐỎ → local-adjust 8-hướng
+                    // xử lý cuối, hoặc user xử lý. Tránh hao hụt lỗ mép (nhất quán generate phẳng).
                 }
-                if (ok && Math.Abs(li - lastValid) > spacing * MIN_DIST_FACTOR_AFTER_RETREAT)
+                if (Math.Abs(li - lastValid) > spacing * MIN_DIST_FACTOR_AFTER_RETREAT)
                     AddPointVary(dict, li, fixedCoord, axisIsX);
             }
 

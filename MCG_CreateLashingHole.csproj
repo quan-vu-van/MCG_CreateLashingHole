@@ -14,11 +14,34 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
-  <!-- Debug: timestamp để tránh lock DLL khi AutoCAD đang mở -->
+  <!-- Debug: timestamp để tránh lock DLL khi AutoCAD đang mở.
+       ⚠️ WPF quirk: build sinh một sub-build tạm "*_wpftmp" để biên dịch XAML,
+       sub-build này evaluate LẠI project → $([System.DateTime]::Now) ra giây khác.
+       Hậu quả: DLL được đặt tên theo evaluation build chính (vd ..._054101), còn
+       URI assembly nhúng trong BAML/.g.cs lại theo evaluation _wpftmp (vd ..._054102)
+       → runtime khi load palette báo "Could not load assembly ..._<giây khác>".
+       Vá: sinh timestamp MỘT LẦN ở build chính rồi ghi ra file tạm; sub-build _wpftmp
+       đọc lại đúng giá trị đó → tên DLL và URI trong BAML luôn khớp. -->
   <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
-    <BuildTimestamp>$([System.DateTime]::Now.ToString("yyyyMMdd_HHmmss"))</BuildTimestamp>
+    <_IsWpfTempBuild>false</_IsWpfTempBuild>
+    <_IsWpfTempBuild Condition="$(MSBuildProjectName.EndsWith('_wpftmp'))">true</_IsWpfTempBuild>
+    <_BuildStampFile>$([System.IO.Path]::Combine($([System.IO.Path]::GetTempPath()), 'MCG_LashingHole.buildstamp'))</_BuildStampFile>
+
+    <!-- Sub-build _wpftmp: DÙNG LẠI timestamp mà build chính đã ghi (đảm bảo khớp) -->
+    <BuildTimestamp Condition="'$(_IsWpfTempBuild)' == 'true' and Exists('$(_BuildStampFile)')">$([System.IO.File]::ReadAllText('$(_BuildStampFile)').Trim())</BuildTimestamp>
+    <!-- Build chính (hoặc fallback nếu file chưa có): sinh timestamp mới -->
+    <BuildTimestamp Condition="'$(BuildTimestamp)' == ''">$([System.DateTime]::Now.ToString("yyyyMMdd_HHmmss"))</BuildTimestamp>
+
     <AssemblyName>MCG_LashingHole_$(BuildTimestamp)</AssemblyName>
   </PropertyGroup>
+
+  <!-- Ghi timestamp của build CHÍNH ra file tạm TRƯỚC khi WPF spawn sub-build _wpftmp -->
+  <Target Name="WriteBuildStamp"
+          Condition="'$(Configuration)' == 'Debug' and '$(_IsWpfTempBuild)' != 'true'"
+          BeforeTargets="BeforeBuild;MarkupCompilePass1;GenerateTemporaryTargetAssembly">
+    <WriteLinesToFile File="$(_BuildStampFile)" Lines="$(BuildTimestamp)" Overwrite="true" />
+    <Message Text="[BuildStamp] $(AssemblyName) (stamp=$(_BuildStampFile))" Importance="High" />
+  </Target>
 
   <!-- Release: tên chuẩn MCG_* theo MCGVN Installation Guide -->
   <PropertyGroup Condition="'$(Configuration)' != 'Debug'">
