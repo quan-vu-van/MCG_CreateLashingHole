@@ -14,6 +14,19 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
+  <!-- Cách ly design-time build của IDE (VS Code C# ext) khỏi obj/ thật.
+       VS Code định kỳ chạy build ngầm để phục vụ IntelliSense (đặt $(DesignTimeBuild)=true).
+       Build ngầm này CŨNG ghi vào obj\...\UI\LashingHolePalette.g.cs (đường dẫn KHÔNG có
+       timestamp, không giống DLL output). Nếu nó chạy xen giữa lúc build thật (dotnet build
+       task) đang MarkupCompile và Compile, file .g.cs bị ghi đè bởi AssemblyName của build
+       ngầm → DLL cuối cùng và URI nhúng trong .g.cs LỆCH NHAU → lỗi NETLOAD
+       "Could not load file or assembly '...timestamp khác'". Tách hẳn thư mục obj cho
+       design-time build để không bao giờ đụng file với build thật. -->
+  <PropertyGroup Condition="'$(DesignTimeBuild)' == 'true' or '$(BuildingProject)' == 'false'">
+    <BaseIntermediateOutputPath>$(BaseIntermediateOutputPath)DesignTimeBuild\</BaseIntermediateOutputPath>
+    <IntermediateOutputPath>$(IntermediateOutputPath)DesignTimeBuild\</IntermediateOutputPath>
+  </PropertyGroup>
+
   <!-- Debug: timestamp để tránh lock DLL khi AutoCAD đang mở.
        ⚠️ WPF quirk: build sinh một sub-build tạm "*_wpftmp" để biên dịch XAML,
        sub-build này evaluate LẠI project → $([System.DateTime]::Now) ra giây khác.

@@ -1,3 +1,28 @@
+## Session 2026-08-20 16:32 — 🐞 FIX (root cause thật) lỗi netload "Could not load assembly ..._<giây khác>" tái phát
+
+### Triệu chứng
+- Lỗi lặp lại y hệt session 2026-08-15 nhưng KHÁC nguyên nhân: NETLOAD báo `Could not load file or assembly 'MCG_LashingHole_20260820_154123'`, trong khi DLL trên đĩa là `..._154122` (lệch 1 giây, user xác nhận CHỈ build 1 lần — không tự bấm build 2 lần).
+
+### Điều tra
+- Đọc trực tiếp `Microsoft.WinFX.targets` (SDK `Microsoft.NET.Sdk.WindowsDesktop` cài trong máy) + chạy build thật với `-v:normal`, kiểm tra `obj\` sau build.
+- **Xác nhận: cơ chế `_wpftmp` (root cause của fix 2026-08-15) KHÔNG hề chạy** với XAML hiện tại của `UI\LashingHolePalette.xaml` (không có `x:Type`/`clr-namespace` local-type reference nào cần Pass2) — build chỉ có DUY NHẤT 1 evaluation, `_BuildStampFile` không hề được dùng tới.
+- Root cause thật: `LashingHolePalette.g.cs` (chứa URI resource nhúng) được ghi ra đường dẫn CỐ ĐỊNH `obj\x64\Debug\UI\LashingHolePalette.g.cs` (không có timestamp), trong khi `AssemblyName` đổi mỗi build. VS Code (C# extension) chạy **design-time build ngầm** (phục vụ IntelliSense, tự động, user không biết) — build ngầm này CŨNG ghi vào đúng path đó. Nếu nó chen giữa lúc build thật đang MarkupCompile→Compile, nó ghi đè `.g.cs` bằng AssemblyName của NÓ → `csc.exe` của build thật compile phải file đã bị ghi đè → DLL cuối và URI nhúng LỆCH NHAU.
+- Note cũ trong session 2026-08-15 ("`.g.cs` trên đĩa nhảy timestamp do design-time build — vô hại, không vào DLL thật") — **SAI**, đây chính là nguyên nhân thật.
+
+### Sửa (csproj)
+- Thêm `PropertyGroup Condition="'$(DesignTimeBuild)' == 'true' or '$(BuildingProject)' == 'false'"` đặt `BaseIntermediateOutputPath`/`IntermediateOutputPath` sang `obj\...\DesignTimeBuild\` riêng — design-time build của IDE không bao giờ đụng file `obj\` của build thật nữa (không chỉ `.g.cs`, mọi intermediate file).
+- Giữ nguyên cơ chế buildstamp file (`WriteBuildStamp`/`_IsWpfTempBuild`) từ session trước — vẫn đúng, chỉ là hiện KHÔNG active cho XAML hiện tại; vẫn có ích nếu sau này XAML thêm local-type ref khiến `_wpftmp` kích hoạt lại.
+- Verify: clean rebuild (`rm -rf obj bin && dotnet build -p:Platform=x64`), grep binary DLL tìm chuỗi `MCG_LashingHole_[0-9_]*` → chỉ ĐÚNG 1 tên duy nhất trùng khớp tên file.
+
+### Trạng thái
+- Build PASS: `MCG_LashingHole_20260820_163249.dll` — DLL và URI nhúng khớp nhau.
+
+### Bước tiếp theo
+- User NETLOAD DLL mới nhất trong `bin\x64\Debug\`.
+- Theo dõi thêm vài lần build/save liên tục trong VS Code xem lỗi còn tái phát không (fix nhắm đúng root cause nhưng chưa stress-test với design-time build thật của C# extension chạy song song).
+
+---
+
 ## Session 2026-08-15 06:03 — 🐞 FIX lỗi netload "Could not load assembly ..._<giây khác>"
 
 ### Triệu chứng
