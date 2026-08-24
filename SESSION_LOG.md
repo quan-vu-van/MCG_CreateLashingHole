@@ -1,3 +1,129 @@
+## Session 2026-08-24 16:21 — 🐞 FIX root cause thật: DesignTimeBuild\ ghi ra gốc project (+ .gitignore)
+
+### Yêu cầu (user)
+1. Thêm `DesignTimeBuild/` vào `.gitignore` (đang là rác untracked trong `git status`).
+2. Điều tra tiếp root cause thật vì sao `BaseIntermediateOutputPath` không resolve vào `obj\` như
+   session 2026-08-20 kỳ vọng (session 11:27 hôm nay mới chỉ vá triệu chứng bằng
+   `DefaultItemExcludes`, chưa biết nguyên nhân).
+
+### Điều tra (dùng `dotnet build -getProperty:` để soi giá trị property đã evaluate, không cần build thật)
+```
+dotnet build MCG_CreateLashingHole.csproj -p:DesignTimeBuild=true -p:BuildingProject=false ^
+  -getProperty:BaseIntermediateOutputPath -getProperty:IntermediateOutputPath
+```
+- `BaseIntermediateOutputPath` → `obj\DesignTimeBuild\` — **ĐÚNG** như PropertyGroup dòng 25-27 (bản cũ) dự định.
+- `IntermediateOutputPath` → `DesignTimeBuild\` — **SAI**, thiếu tiền tố `obj\`, tức nằm ở gốc project.
+
+**Root cause thật**: PropertyGroup cách ly (dòng 25-28 bản cũ) gán ĐỒNG THỜI cả
+`BaseIntermediateOutputPath` lẫn `IntermediateOutputPath`:
+```xml
+<BaseIntermediateOutputPath>$(BaseIntermediateOutputPath)DesignTimeBuild\</BaseIntermediateOutputPath>
+<IntermediateOutputPath>$(IntermediateOutputPath)DesignTimeBuild\</IntermediateOutputPath>
+```
+`$(BaseIntermediateOutputPath)` đã có default `"obj\"` rất sớm (set trong `Sdk.props`, import trước
+cả nội dung `.csproj`) → tham chiếu nó ở đây AN TOÀN, ra đúng `obj\DesignTimeBuild\`.
+Nhưng `$(IntermediateOutputPath)` (thư mục con theo Configuration/Platform, vd `obj\x64\Debug\`)
+**CHƯA có default** tại thời điểm PropertyGroup này chạy — default của nó chỉ được tính SAU, trong
+`Microsoft.Common.CurrentVersion.targets` (import qua `Sdk.targets`, ở CUỐI file `.csproj`, sau mọi
+nội dung ta viết). Vì vậy `$(IntermediateOutputPath)DesignTimeBuild\` ở dòng 27 đọc `$(IntermediateOutputPath)`
+lúc nó còn RỖNG → kết quả chỉ là `"DesignTimeBuild\"` (tương đối so với gốc project, tức gốc project).
+Tệ hơn: một khi property được set tường minh (dù set thành `"DesignTimeBuild\"`), điều kiện
+`Condition="'$(IntermediateOutputPath)' == ''"` mà SDK dùng để tự tính default SAU đó sẽ bị bỏ qua
+(vì lúc đó nó không còn rỗng nữa) → giá trị sai này bị "khoá cứng" luôn, không được SDK ghi đè lại.
+
+### Sửa
+- Bỏ hẳn dòng gán `<IntermediateOutputPath>` tường minh trong PropertyGroup cách ly — CHỈ giữ
+  `<BaseIntermediateOutputPath>`. Để SDK tự tính `IntermediateOutputPath` sau đó (theo đúng thứ tự
+  evaluation bình thường), nó sẽ tự động kế thừa `BaseIntermediateOutputPath` đã bị đổi hướng →
+  ra đúng `obj\DesignTimeBuild\Debug\` (đã verify lại bằng `-getProperty` — khớp).
+- Verify thêm bằng build thật giả lập chính xác flag mà IDE dùng
+  (`-p:DesignTimeBuild=true -p:BuildingProject=false -p:SkipCompilerExecution=true`): xác nhận
+  `DesignTimeBuild\` không còn xuất hiện ở gốc project nữa, mọi thứ nằm gọn trong `obj\DesignTimeBuild\`.
+  (Lỗi MSB3030 "could not copy .dll" khi giả lập là bình thường — do cố tình
+  `SkipCompilerExecution=true` nên không có DLL để copy, đúng bản chất design-time build thật.)
+- Build thật (`dotnet build -c Debug`) vẫn PASS bình thường sau khi sửa (`MCG_LashingHole_20260824_162125.dll`).
+- Thêm `/DesignTimeBuild` vào `.gitignore` (yêu cầu 1) — dù giờ nó không còn sinh ra ở gốc project
+  nữa trong điều kiện test, vẫn giữ dòng này làm lưới an toàn (`git status` sạch nếu có edge-case nào
+  khác vẫn khiến nó lọt ra ngoài `obj\`).
+- Giữ nguyên `DefaultItemExcludes` (session 11:27) làm lớp phòng thủ thứ 2 — không gỡ, vì đây là
+  fix đúng đắn độc lập (không phụ thuộc việc thư mục nằm ở đâu).
+
+### Trạng thái
+- Build PASS. Root cause đã xác định rõ ràng và vá đúng chỗ (không còn là "belt-and-suspenders"
+  đoán mò nữa). `.gitignore` đã cập nhật.
+- Cần theo dõi thêm vài phiên làm việc thật trong VS Code (không phải giả lập) để xác nhận
+  `DesignTimeBuild\` không tái xuất hiện ở gốc project nữa trong thực tế.
+
+### Bước tiếp theo
+- User NETLOAD `MCG_LashingHole_20260824_162125.dll` nếu muốn, dù session này không đổi logic
+  nghiệp vụ nào (chỉ sửa `.csproj`/`.gitignore`).
+- Theo dõi `git status` vài lần build/save tiếp theo — nếu `DesignTimeBuild/` không còn xuất hiện
+  nữa thì coi như đã xử lý dứt điểm, có thể cân nhắc gỡ `DefaultItemExcludes` (không bắt buộc, để
+  cũng không hại gì).
+
+---
+
+## Session 2026-08-24 11:40 — 🐛 FIX tên block gợi ý ở bước Block Packing bị trùng, phải gõ lại
+
+### Triệu chứng (user)
+- Ở bước cuối (đóng Block sau khi tạo lỗ), tool luôn gợi ý `<PanelName>_L.H` làm `DefaultValue`
+  cho prompt "Block name" — không kiểm tra trùng TRƯỚC khi hỏi. Nếu block đó đã tồn tại từ lần
+  chạy trước (cùng PanelName), user phải tự gõ lại tên khác.
+
+### Nguyên nhân
+- `LashingWorkflowService.RunPostProcess` (khoảng dòng 661-708 cũ): `baseName` tính 1 lần từ
+  `PanelName + "_L.H"`, không đối chiếu `BlockTable` trước khi đưa vào `PromptStringOptions.
+  DefaultValue`. Việc chống trùng chỉ chạy SAU khi user đã accept tên (Enter) — lúc đó mới biết
+  trùng, và chỉ nối cứng `"_2"` (không kiểm tra `_2` có trùng tiếp không).
+- `BlockPackingService` đã có sẵn helper `ResolveUniqueBlockName(bt, baseName)` (baseName →
+  baseName_2 → baseName_3 …, fallback GUID nếu hết 1000 lần thử) nhưng đang `private` và chỉ
+  được `PackIntoBlock` dùng nội bộ lúc TẠO block thật — không được tái dùng cho việc gợi ý tên
+  trước khi hỏi.
+
+### Sửa
+- `BlockPackingService.ResolveUniqueBlockName`: `private static` → `internal static` (cùng
+  assembly, không đổi chữ ký/logic) để `LashingWorkflowService` gọi lại được — tránh viết trùng
+  logic đặt tên ở 2 nơi.
+- `LashingWorkflowService.RunPostProcess`: trước khi vào vòng lặp hỏi tên, mở 1 transaction đọc
+  `BlockTable` và gọi `BlockPackingService.ResolveUniqueBlockName(bt, baseName)` ngay — `DefaultValue`
+  hiển thị cho user LUÔN LÀ tên chưa tồn tại. Nhánh xử lý trùng bên trong vòng lặp (khi user tự gõ
+  đúng tên đã tồn tại) cũng đổi từ nối cứng `"_2"` sang gọi lại `ResolveUniqueBlockName` — chống
+  được cả trường hợp `_2` cũng đã tồn tại.
+- Build PASS (`MCG_LashingHole_20260824_114018.dll`).
+
+### Trạng thái
+- Chưa NETLOAD test thực tế trong AutoCAD (cần user xác nhận: chạy 2 lần liên tiếp cùng
+  PanelName → lần 2 tool phải tự gợi ý `..._L.H_2` thay vì lặp lại tên đã dùng).
+
+---
+
+## Session 2026-08-24 11:34 — 🎨 Đồng bộ button Start/Batch/Audit/Audit Interference thành ToolbarButtonStyle (giống Add/Scan/Insert của ref)
+
+### Đã làm
+- User yêu cầu làm lại tiếp: 4 nút hành động phải giống hệt kiểu Add/Scan/Insert của MCG_FittingManagement — gọn (MinWidth 70, Height 26 mặc định), xếp ngang trong `WrapPanel`, chỉ 2 tông màu (`ToolbarPrimaryButtonStyle`=xanh dương cho Start, `ToolbarButtonStyle`=xám mặc định cho Batch/Audit/Audit Interference), mô tả dài chuyển vào `ToolTip` thay vì caption `TextBlock` riêng dưới mỗi nút.
+- `UI/LashingHoleStyles.xaml`: xoá 3 style màu tôi tự thêm ở session trước (`SuccessButtonStyle`/`AuditButtonStyle`/`DangerButtonStyle` — lệch khỏi ngôn ngữ thiết kế thật của ref), thay bằng `ToolbarButtonStyle`/`ToolbarPrimaryButtonStyle` copy nguyên từ `FittingStyles.xaml` (BasedOn `Button`/`PrimaryButtonStyle`, Margin/Padding/MinWidth cho layout ngang).
+- `UI/LashingHolePalette.xaml`: Start+Batch chuyển vào 1 `WrapPanel` chung (bỏ 2 dòng caption HelperText, thay bằng ToolTip), GroupBox "Audit" đổi `StackPanel` dọc → `WrapPanel` ngang cho Audit Holes + Audit Interference, rút gọn label nút (`"Audit Holes"`, `"Audit Interference"` thay vì câu dài).
+- Build PASS lại (`MCG_LashingHole_20260824_113438.dll`).
+
+## Session 2026-08-24 11:27 — 🎨 Đồng bộ UI theo MCG_FittingManagement (light theme) + fix build DesignTimeBuild\ đè glob
+
+### Đã làm
+- Tạo `UI/LashingHoleStyles.xaml` — ResourceDictionary style dùng chung (mô phỏng `FittingStyles.xaml` của MCG_FittingManagement), light theme: `Button` mặc định + 4 style kế thừa qua `BasedOn` (`PrimaryButtonStyle`=Start, `SuccessButtonStyle`=Batch, `AuditButtonStyle`=Audit, `DangerButtonStyle`=Audit Interference — mỗi style có `ControlTemplate` bo góc + trigger `IsMouseOver`/`IsPressed`), `GroupBox`, `StatusTextStyle`, `HelperTextStyle`, `LblStyle`.
+- Sửa `UI/LashingHolePalette.xaml`: nền `#1E1E1E` (dark) → `#FFF2F2F2` (light), merge `LashingHoleStyles.xaml`, 4 section (Input Parameters / Execution Mode / Settings / Audit) bọc trong `GroupBox` thay cho `SectionHeader` TextBlock + `Separator` cũ, bỏ toàn bộ màu set tay trên từng control. Không đổi `x:Name` nào → `LashingHolePalette.xaml.cs` không cần sửa.
+- Cập nhật `CLAUDE.md` mục 10 (bảng "Màu sắc chuẩn"): đổi từ dark theme placeholder cũ sang light theme khớp giá trị thực tế vừa áp dụng.
+- **Phát hiện + fix bug build phụ** (không phải mục tiêu ban đầu nhưng chặn build khi verify): thư mục `DesignTimeBuild\` (cache design-time build của VS Code C# ext) đang bị ghi ra **gốc project** thay vì dưới `obj\` như session 2026-08-20 dự định (PropertyGroup `BaseIntermediateOutputPath` ở dòng ~25-28 không resolve đúng như kỳ vọng trong môi trường thực tế — nguyên nhân sâu chưa điều tra hết, nghi IDE truyền `BaseIntermediateOutputPath` như global property đè lên). Vì nằm ngoài `obj\`/`bin\`, nó lọt vào glob `**/*.cs` mặc định của SDK → build thật báo trùng định nghĩa (`CS0579`, `CS0102`...). **Fix**: thêm `DesignTimeBuild\**` vào `$(DefaultItemExcludes)` trong `.csproj` — chặn glob bất kể thư mục này ghi ra đâu. Verify: xoá `DesignTimeBuild/ obj/ bin/`, build lại → PASS (`MCG_LashingHole_20260824_112702.dll`); thư mục `DesignTimeBuild/` tái xuất hiện ngay sau đó (xác nhận đúng là tiến trình ngầm độc lập, không phải do lệnh build của tôi) nhưng build tiếp theo vẫn PASS bình thường.
+
+### Trạng thái
+- Build PASS. UI đã đổi light theme, chưa NETLOAD trong AutoCAD để xem trực quan (cần user làm thủ công).
+- Root cause thật sự vì sao `BaseIntermediateOutputPath` không resolve vào `obj\` như session 2026-08-20 kỳ vọng **chưa được điều tra tới cùng** — fix hiện tại (`DefaultItemExcludes`) là belt-and-suspenders, chặn triệu chứng (lỗi build) chứ chưa chắc chặn được thư mục `DesignTimeBuild/` xuất hiện ở gốc project (vô hại cho build nhưng vẫn là rác `git status`, chưa thêm vào `.gitignore`).
+
+### Bước tiếp theo
+- User NETLOAD `bin\x64\Debug\MCG_LashingHole_20260824_112702.dll` (hoặc bản mới nhất), mở palette `MCG_CreateLashingHole`, xác nhận bằng mắt: nền sáng, 4 GroupBox, nút có hover/pressed, giao diện cùng "họ" với MCG_FittingManagement.
+- Cân nhắc thêm `DesignTimeBuild/` vào `.gitignore` (hiện đang là untracked rác trong `git status`).
+- Nếu muốn, điều tra tiếp vì sao `BaseIntermediateOutputPath` của PropertyGroup design-time không resolve vào `obj\` — có thể do VS Code C# ext truyền property qua command line (global property, không override được bằng `<PropertyGroup>` thường trong .csproj).
+
+---
+
 ## Session 2026-08-20 16:32 — 🐞 FIX (root cause thật) lỗi netload "Could not load assembly ..._<giây khác>" tái phát
 
 ### Triệu chứng

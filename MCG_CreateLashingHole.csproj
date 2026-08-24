@@ -24,7 +24,13 @@
        design-time build để không bao giờ đụng file với build thật. -->
   <PropertyGroup Condition="'$(DesignTimeBuild)' == 'true' or '$(BuildingProject)' == 'false'">
     <BaseIntermediateOutputPath>$(BaseIntermediateOutputPath)DesignTimeBuild\</BaseIntermediateOutputPath>
-    <IntermediateOutputPath>$(IntermediateOutputPath)DesignTimeBuild\</IntermediateOutputPath>
+  </PropertyGroup>
+
+  <!-- Belt-and-suspenders cho isolation ở trên: nếu design-time build nào đó vẫn ghi
+       DesignTimeBuild\ ra gốc project (thay vì dưới obj\), thư mục này KHÔNG bao giờ được
+       glob vào Compile/Page mặc định của build thật, tránh lỗi trùng định nghĩa. -->
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);DesignTimeBuild\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <!-- Debug: timestamp để tránh lock DLL khi AutoCAD đang mở.

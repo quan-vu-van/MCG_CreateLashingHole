@@ -659,7 +659,16 @@ namespace MCG_CreateLashingHole.Services
             }
 
             // ── BLOCK PACKING: hỏi tên qua command line (Esc = bỏ qua) ──
+            // Tên gợi ý (DefaultValue) phải KHÔNG trùng ngay từ lần hỏi đầu tiên — dùng chung
+            // ResolveUniqueBlockName với PackIntoBlock để tránh user phải gõ lại tên do trùng
+            // với block đã đóng ở lần chạy trước.
             string baseName = (string.IsNullOrWhiteSpace(p.PanelName) ? "PNL" : p.PanelName.Trim()) + "_L.H";
+            using (var trSuggest = db.TransactionManager.StartTransaction())
+            {
+                var btSuggest = (BlockTable)trSuggest.GetObject(db.BlockTableId, OpenMode.ForRead);
+                baseName = BlockPackingService.ResolveUniqueBlockName(btSuggest, baseName);
+                trSuggest.Commit();
+            }
             string packed   = null;
             while (true)
             {
@@ -678,12 +687,12 @@ namespace MCG_CreateLashingHole.Services
                 {
                     var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
                     exists = bt.Has(name);
+                    if (exists) baseName = BlockPackingService.ResolveUniqueBlockName(bt, name);
                     tr.Commit();
                 }
                 if (exists)
                 {
-                    ed.WriteMessage($"\nBlock '{name}' already exists. Choose another name.");
-                    baseName = name + "_2";
+                    ed.WriteMessage($"\nBlock '{name}' already exists. Suggested: '{baseName}'.");
                     continue;
                 }
 

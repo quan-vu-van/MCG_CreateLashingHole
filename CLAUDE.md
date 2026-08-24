@@ -331,14 +331,14 @@ Application.Current.Dispatcher.Invoke(() =>
 });
 ```
 
-### Màu sắc chuẩn (Dark theme — AutoCAD)
+### Màu sắc chuẩn (Light theme — đồng bộ MCG_FittingManagement)
 ```xml
-<Color x:Key="BackgroundColor">#FF1E1E1E</Color>
-<Color x:Key="SurfaceColor">#FF2D2D2D</Color>
-<Color x:Key="AccentColor">#FF0078D4</Color>
-<Color x:Key="BorderColor">#FF404040</Color>
-<Color x:Key="TextPrimaryColor">#FFEEEEEE</Color>
-<Color x:Key="TextSecondaryColor">#FF999999</Color>
+<Color x:Key="BackgroundColor">#FFF2F2F2</Color>
+<Color x:Key="SurfaceColor">#FFFFFFFF</Color>
+<Color x:Key="AccentColor">#FF005E9E</Color>
+<Color x:Key="BorderColor">#FFCCCCCC</Color>
+<Color x:Key="TextPrimaryColor">#FF111111</Color>
+<Color x:Key="TextSecondaryColor">#FF666666</Color>
 <FontFamily x:Key="UIFont">Segoe UI</FontFamily>
 ```
 

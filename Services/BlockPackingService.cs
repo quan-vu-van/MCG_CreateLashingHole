@@ -401,7 +401,7 @@ namespace MCG_CreateLashingHole.Services
         }
 
         /// <summary>Trả về tên block chưa tồn tại: baseName, baseName_2, baseName_3, …</summary>
-        private static string ResolveUniqueBlockName(BlockTable bt, string baseName)
+        internal static string ResolveUniqueBlockName(BlockTable bt, string baseName)
         {
             if (!bt.Has(baseName)) return baseName;
             for (int i = 2; i < 1000; i++)
