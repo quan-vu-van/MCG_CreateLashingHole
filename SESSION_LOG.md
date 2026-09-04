@@ -1,3 +1,22 @@
+## Session 2026-09-04 — Migrate .NET 8 cho AutoCAD 2026
+
+### Đã làm
+- `MCG_CreateLashingHole.csproj`: `net48` → `net8.0-windows`; `EnableDynamicLoading` + `RollForward=LatestMinor` + output cố định `bin\$(Config)\`.
+- `AcadPath` auto-detect chỉ còn 2026 → 2025 (bỏ 2021–2024).
+- Bỏ block `<Reference>` framework (WPF/WinForms lấy từ `UseWPF`/`UseWindowsForms`).
+- `NoWarn CA1416`.
+- Giữ nguyên logic `_wpftmp` buildstamp + `DesignTimeBuild\` isolation.
+- Target `DeployToCustomTools` (Release): copy DLL đơn → deploy NGUYÊN thư mục vào `C:\CustomTools\Autocad\MCG_LashingHole\`.
+- Build `dotnet build -c Debug` và `-c Release` → **0 error, 0 warning**. Release deploy OK.
+
+### Trạng thái
+- Bản .NET 8 chỉ chạy AutoCAD 2025+. Chưa test trong AutoCAD 2026 thật.
+
+### Bước tiếp theo
+- NETLOAD / bundle autoload trong AutoCAD 2026 → lệnh tạo lashing hole, palette.
+
+---
+
 ## Session 2026-08-24 16:21 — 🐞 FIX root cause thật: DesignTimeBuild\ ghi ra gốc project (+ .gitignore)
 
 ### Yêu cầu (user)
